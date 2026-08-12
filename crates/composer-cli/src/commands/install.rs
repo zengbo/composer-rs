@@ -86,8 +86,10 @@ pub async fn run(args: InstallArgs) -> Result<()> {
             minimum_stability: manifest.minimum_stability().to_string(),
             concurrency,
             ignore_platform_reqs: args.ignore_platform_reqs,
+            packages_to_update: Vec::new(),
+            update_deps: Default::default(),
         };
-        let resolution = resolve(&manifest, &options, &cwd)
+        let resolution = resolve(&manifest, &options, &cwd, None)
             .await
             .context("dependency resolution (PubGrub)")?;
         let lock = resolution.to_lock(&manifest);

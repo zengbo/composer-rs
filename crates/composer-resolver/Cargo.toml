@@ -20,3 +20,8 @@ pubgrub = { workspace = true }
 version-ranges = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+composer-manifest = { workspace = true }
+tokio = { workspace = true }

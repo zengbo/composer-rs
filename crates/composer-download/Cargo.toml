@@ -33,3 +33,11 @@ tokio-util = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tar = { workspace = true }
+zip = { workspace = true }
+wiremock = { workspace = true }
+composer-manifest = { workspace = true }
+composer-resolver = { workspace = true }
+composer-autoload = { workspace = true }
+composer-lock = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

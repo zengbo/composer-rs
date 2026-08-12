@@ -232,6 +232,21 @@ impl PackageIndex {
             .max_by(|a, b| a.version.cmp(&b.version))
             .map(|iv| iv.locked.clone())
     }
+
+    /// Pin packages to their lockfile snapshots for partial update.
+    ///
+    /// Always re-inserts each lock snapshot first so the pinned version exists even
+    /// when the registry no longer lists it (or uses a different version key).
+    /// Then drops every other real version of that package.
+    pub fn pin_to_locked(&mut self, pins: &HashMap<String, LockedPackage>) {
+        for (name, locked) in pins {
+            self.insert_locked(locked.clone());
+            if let Some(entry) = self.packages.get_mut(name) {
+                let want = locked.version.clone();
+                entry.retain(|_key, iv| iv.provided_by.is_none() && iv.locked.version == want);
+            }
+        }
+    }
 }
 
 impl From<crate::sources::SourceKind> for IndexSource {
@@ -240,5 +255,67 @@ impl From<crate::sources::SourceKind> for IndexSource {
             crate::sources::SourceKind::Path => Self::Path,
             crate::sources::SourceKind::Vcs => Self::Vcs,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use composer_lock::{DistInfo, LockedPackage};
+    use std::collections::BTreeMap;
+
+    fn pkg(name: &str, ver: &str, provide: &[(&str, &str)]) -> LockedPackage {
+        LockedPackage {
+            name: name.into(),
+            version: ver.into(),
+            source: None,
+            dist: Some(DistInfo {
+                dist_type: "zip".into(),
+                url: format!("https://example.com/{name}.zip"),
+                reference: None,
+                shasum: None,
+                mirrors: None,
+            }),
+            require: BTreeMap::new(),
+            require_dev: BTreeMap::new(),
+            package_type: Some("library".into()),
+            extra: None,
+            autoload: None,
+            autoload_dev: None,
+            notification_url: None,
+            license: vec![],
+            description: None,
+            homepage: None,
+            keywords: vec![],
+            time: None,
+            replace: BTreeMap::new(),
+            provide: provide
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+            conflict: BTreeMap::new(),
+            suggest: BTreeMap::new(),
+            bin: vec![],
+            abandoned: None,
+        }
+    }
+
+    #[test]
+    fn multiple_providers_for_virtual() {
+        let mut index = PackageIndex::new();
+        index.insert_locked(pkg("vendor/impl-a", "1.0.0", &[("virtual/pkg", "1.0.0")]));
+        index.insert_locked(pkg("vendor/impl-b", "2.0.0", &[("virtual/pkg", "2.0.0")]));
+        index.register_virtual_packages();
+
+        assert!(index.has_package("virtual/pkg"));
+        assert_eq!(index.all_versions("virtual/pkg").len(), 2);
+        assert_eq!(
+            index.real_provider_for("virtual/pkg", "1.0.0"),
+            Some("vendor/impl-a")
+        );
+        assert_eq!(
+            index.real_provider_for("virtual/pkg", "2.0.0"),
+            Some("vendor/impl-b")
+        );
     }
 }

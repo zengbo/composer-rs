@@ -57,6 +57,9 @@ composer-rs install
 
 # Resolve latest matching versions, rewrite lock, install
 composer-rs update
+composer-rs update vendor/package        # partial: only listed package
+composer-rs update vendor/package -w     # also its non-root dependencies
+composer-rs update vendor/package -W     # also all dependencies (incl. root reqs)
 
 # Add / remove packages
 composer-rs require psr/log
@@ -80,6 +83,10 @@ composer-rs cache clear
 |------|-------------|
 | `--concurrency N` | Cap parallel downloads (default: `cores×8`, clamped 16–128) |
 | `--no-dev` | Skip `require-dev` |
+| `--ignore-platform-reqs` | Skip `php` / `ext-*` checks |
+| `--prefer-source` | Prefer VCS clone over dist zip |
+| `-w` / `--with-dependencies` | Partial update: also free non-root deps of listed packages |
+| `-W` / `--with-all-dependencies` | Partial update: also free all deps (including root reqs) |
 | `--verify-checksums` | Fail on dist shasum mismatch |
 | `--dry-run` | Resolve / plan only |
 | `-o` / `--optimize-autoloader` | Classmap optimization |
@@ -136,7 +143,8 @@ Path packages are **symlinked** into `vendor/` by default. VCS packages are clon
 - Reads/writes standard `composer.json` and `composer.lock`
 - Installs dist archives from Packagist (zip / tar.gz / …)
 - Path + VCS repositories, `extra.installer-paths`, PubGrub resolution
-- Generates a usable PSR-4 / classmap autoloader
+- Platform requirements (`php`, `ext-*`) with `config.platform` overrides
+- Generates a usable PSR-4 / classmap autoloader with `platform_check.php`
 - **Not supported (yet):** Composer plugins as PHP, full scripts lifecycle hooks
 
 For plugin-heavy projects keep using official Composer; use composer-rs where install speed and worktree disk matter most (CI, monorepos, many branches).

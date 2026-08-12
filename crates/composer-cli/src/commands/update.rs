@@ -6,7 +6,8 @@ use clap::Args;
 use composer_autoload::{generate, AutoloadOptions};
 use composer_download::{default_concurrency, PackageInstaller};
 use composer_manifest::ComposerJson;
-use composer_resolver::{resolve, ResolveOptions};
+use composer_core::{check_requirements, Platform};
+use composer_resolver::{resolve, ResolveOptions, UpdateDeps};
 use std::time::Instant;
 
 #[derive(Args, Debug, Clone)]
@@ -48,6 +49,14 @@ pub struct UpdateArgs {
     /// Prefer VCS source installs over dist archives
     #[arg(long)]
     pub prefer_source: bool,
+
+    /// Also update dependencies of listed packages, except root requirements
+    #[arg(short = 'w', long = "with-dependencies")]
+    pub with_dependencies: bool,
+
+    /// Also update dependencies of listed packages, including root requirements
+    #[arg(short = 'W', long = "with-all-dependencies")]
+    pub with_all_dependencies: bool,
 }
 
 pub async fn run(args: UpdateArgs) -> Result<()> {
@@ -58,14 +67,42 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     if !json_path.exists() {
         bail!("composer.json not found");
     }
+    let update_deps = if args.with_all_dependencies {
+        UpdateDeps::WithAllDependencies
+    } else if args.with_dependencies {
+        UpdateDeps::WithDependencies
+    } else {
+        UpdateDeps::OnlyListed
+    };
+
     if !args.packages.is_empty() {
-        info("Partial updates are not fully supported yet — updating entire tree");
+        if lock_path.exists() {
+            let scope = match update_deps {
+                UpdateDeps::OnlyListed => "listed packages only",
+                UpdateDeps::WithDependencies => "listed + non-root dependencies (-w)",
+                UpdateDeps::WithAllDependencies => "listed + all dependencies (-W)",
+            };
+            info(&format!(
+                "Partial update: {} package(s) ({scope}); others pinned to lock",
+                args.packages.len()
+            ));
+        } else {
+            info(
+                "No composer.lock — cannot pin other packages; resolving full dependency tree",
+            );
+        }
     }
 
     let manifest = ComposerJson::load(&json_path)?;
     let vendor = vendor_dir(&manifest, &cwd);
     let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
     let with_dev = !args.no_dev;
+
+    let existing_lock = if lock_path.exists() && !args.packages.is_empty() {
+        Some(composer_lock::ComposerLock::load(&lock_path)?)
+    } else {
+        None
+    };
 
     let options = ResolveOptions {
         with_dev,
@@ -74,11 +111,18 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         minimum_stability: manifest.minimum_stability().to_string(),
         concurrency,
         ignore_platform_reqs: args.ignore_platform_reqs,
+        packages_to_update: args.packages.clone(),
+        update_deps,
     };
 
-    let resolution = resolve(&manifest, &options, &cwd)
-        .await
-        .context("resolve (PubGrub)")?;
+    let resolution = resolve(
+        &manifest,
+        &options,
+        &cwd,
+        existing_lock.as_ref(),
+    )
+    .await
+    .context("resolve (PubGrub)")?;
     let lock = resolution.to_lock(&manifest);
     let installer_paths = manifest.installer_paths();
 
@@ -99,6 +143,25 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
+    if !args.ignore_platform_reqs {
+        let mut platform = Platform::detect().context("detect PHP platform")?;
+        platform.apply_config_platform(manifest.config.as_ref());
+        check_requirements(&platform, &manifest.require).context("platform check")?;
+        if with_dev {
+            check_requirements(&platform, &manifest.require_dev).context("platform check (dev)")?;
+        }
+        for pkg in lock.packages_to_install(with_dev) {
+            check_requirements(&platform, &pkg.require)
+                .with_context(|| format!("platform check for {}", pkg.name))?;
+        }
+        if platform.reliable {
+            info(&format!(
+                "Platform OK (PHP {})",
+                platform.php_version().as_str()
+            ));
+        }
+    }
+
     lock.save(&lock_path)?;
     success(&format!("Wrote {}", lock_path.display()));
 
@@ -114,8 +177,12 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
 
     let stats = installer.stats().snapshot();
     info(&format!(
-        "cache hits: {}  downloads: {}  hardlinks: {}",
-        stats.cache_hits, stats.downloaded, stats.hardlinks
+        "cache hits: {}  downloads: {}  skipped: {}  hardlinks: {}  copies: {}",
+        stats.cache_hits,
+        stats.downloaded,
+        stats.skipped,
+        stats.hardlinks,
+        stats.copies,
     ));
 
     generate(

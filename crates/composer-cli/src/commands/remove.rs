@@ -64,6 +64,8 @@ pub async fn run(args: RemoveArgs) -> Result<()> {
             ignore_platform_reqs: false,
             prefer_dist: true,
             prefer_source: false,
+            with_dependencies: false,
+            with_all_dependencies: false,
         };
         super::update::run(update_args).await?;
     }
