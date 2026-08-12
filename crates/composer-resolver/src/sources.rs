@@ -75,7 +75,9 @@ impl LocalPathPackage {
             require: self.require.clone(),
             require_dev: BTreeMap::new(),
             package_type: self.package_type.clone(),
-            extra: None,
+            extra: Some(serde_json::json!({
+                "composer-rs": { "symlink": self.symlink }
+            })),
             autoload: self.autoload.clone(),
             autoload_dev: None,
             notification_url: None,

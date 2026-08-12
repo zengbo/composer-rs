@@ -2,7 +2,7 @@
 
 use crate::index::PackageIndex;
 use composer_core::error::{Error, Result};
-use composer_core::{constraint_to_ranges, ComposerVersion, PackageId, Stability, VersionConstraint};
+use composer_core::{constraint_to_ranges, check_requirements, ComposerVersion, PackageId, Platform, Stability, VersionConstraint};
 use composer_lock::LockedPackage;
 use pubgrub::{
     resolve, Dependencies, DependencyConstraints, DependencyProvider, OfflineDependencyProvider,
@@ -22,6 +22,8 @@ pub struct SolveRequest {
     pub minimum_stability: Stability,
     pub root_replace: Vec<String>,
     pub root_provide: Vec<String>,
+    pub platform: Platform,
+    pub ignore_platform_reqs: bool,
 }
 
 /// Run PubGrub and return selected locked packages by name.
@@ -68,7 +70,85 @@ pub fn solve_with_pubgrub(
             }
         }
     }
+    validate_conflicts(&out)?;
     Ok(out)
+}
+
+/// Remap virtual packages to real providers and drop replaced packages.
+pub fn normalize_solution(
+    selected: HashMap<String, LockedPackage>,
+    index: &PackageIndex,
+) -> Result<HashMap<String, LockedPackage>> {
+    let mut remapped = HashMap::new();
+    for (name, pkg) in selected {
+        if name == ROOT {
+            continue;
+        }
+        let real = index
+            .real_provider_for(&name, &pkg.version)
+            .unwrap_or_else(|| index.real_package_name(&name));
+        let locked = if real != name {
+            index
+                .provider_locked(real, &pkg.version)
+                .unwrap_or_else(|| {
+                    let mut p = pkg;
+                    p.name = real.to_string();
+                    p
+                })
+        } else {
+            pkg
+        };
+        // Prefer keeping the first real package if two virtuals collapse to one.
+        remapped.entry(real.to_string()).or_insert(locked);
+    }
+
+    let mut to_remove = Vec::new();
+    for (name, pkg) in &remapped {
+        for replaced in pkg.replace.keys() {
+            if remapped.contains_key(replaced.as_str()) && replaced != name {
+                to_remove.push(replaced.clone());
+            }
+        }
+    }
+    for name in to_remove {
+        remapped.remove(&name);
+    }
+
+    Ok(remapped)
+}
+
+fn version_matches_platform(
+    locked: &LockedPackage,
+    platform: &Platform,
+    ignore: bool,
+) -> bool {
+    // No PHP / no overrides: do not silently drop candidates; install-time
+    // checks will error with a clear remediation message.
+    if ignore || !platform.reliable {
+        return true;
+    }
+    check_requirements(platform, &locked.require).is_ok()
+}
+
+/// Reject solutions where an installed package violates another's `conflict` map.
+fn validate_conflicts(selected: &HashMap<String, LockedPackage>) -> Result<()> {
+    for (name, pkg) in selected {
+        for (other_name, constraint_str) in &pkg.conflict {
+            let Some(other) = selected.get(other_name.as_str()) else {
+                continue;
+            };
+            let constraint = VersionConstraint::new(constraint_str);
+            let other_version = ComposerVersion::parse(&other.version)
+                .map_err(|e| Error::Resolve(e.to_string()))?;
+            if constraint.matches(&other_version) {
+                return Err(Error::Resolve(format!(
+                    "package {name}@{} conflicts with {other_name}@{} (constraint {constraint_str})",
+                    pkg.version, other.version
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Custom provider so we can prefer-stable / prefer-lowest and skip platform pkgs.
@@ -108,6 +188,14 @@ impl ComposerOfflineProvider {
         for name in index.package_names() {
             let mut versions = Vec::new();
             for iv in index.all_versions(name) {
+                if !version_matches_platform(
+                    &iv.locked,
+                    &request.platform,
+                    request.ignore_platform_reqs,
+                ) {
+                    continue;
+                }
+
                 if iv.version.stability() < request.minimum_stability
                     && !iv.version.raw.starts_with("dev-")
                 {
@@ -311,6 +399,8 @@ mod tests {
             minimum_stability: Stability::Stable,
             root_replace: vec![],
             root_provide: vec![],
+            platform: Platform::with_php("8.2.0").unwrap(),
+            ignore_platform_reqs: false,
         };
 
         let sol = solve_with_pubgrub(&index, &request).unwrap();
@@ -343,6 +433,8 @@ mod tests {
             minimum_stability: Stability::Stable,
             root_replace: vec![],
             root_provide: vec![],
+            platform: Platform::with_php("8.2.0").unwrap(),
+            ignore_platform_reqs: false,
         };
 
         let err = solve_with_pubgrub(&index, &request).unwrap_err();
@@ -350,6 +442,42 @@ mod tests {
         assert!(
             msg.contains("PubGrub") || msg.contains("could not"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn package_conflict_rejected() {
+        let mut index = PackageIndex::new();
+        let mut a = pkg("vendor/a", "1.0.0", &[]);
+        a.conflict
+            .insert("vendor/b".into(), "^1.0".into());
+        index.insert_locked(a);
+        index.insert_locked(pkg("vendor/b", "1.0.0", &[]));
+
+        let request = SolveRequest {
+            root_deps: vec![
+                (
+                    PackageId::parse("vendor/a").unwrap(),
+                    VersionConstraint::new("*"),
+                ),
+                (
+                    PackageId::parse("vendor/b").unwrap(),
+                    VersionConstraint::new("*"),
+                ),
+            ],
+            prefer_stable: true,
+            prefer_lowest: false,
+            minimum_stability: Stability::Stable,
+            root_replace: vec![],
+            root_provide: vec![],
+            platform: Platform::with_php("8.2.0").unwrap(),
+            ignore_platform_reqs: false,
+        };
+
+        let err = solve_with_pubgrub(&index, &request).unwrap_err();
+        assert!(
+            err.to_string().contains("conflicts with"),
+            "unexpected error: {err}"
         );
     }
 }

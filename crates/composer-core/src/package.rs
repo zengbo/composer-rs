@@ -44,13 +44,9 @@ impl PackageId {
         self.0.split_once('/').map(|(_, n)| n).unwrap_or(&self.0)
     }
 
+    /// Platform packages (`php`, `ext-*`, …) never use the `vendor/name` form.
     pub fn is_platform(&self) -> bool {
         !self.0.contains('/')
-            || self.0.starts_with("php")
-            || self.0.starts_with("ext-")
-            || self.0.starts_with("lib-")
-            || self.0.starts_with("composer-")
-            || self.0 == "hhvm"
     }
 
     /// Vendor-relative install path: `vendor/name`.
@@ -146,5 +142,11 @@ mod tests {
         assert!(id.is_platform());
         let ext = PackageId::parse("ext-json").unwrap();
         assert!(ext.is_platform());
+    }
+
+    #[test]
+    fn vendor_packages_are_not_platform() {
+        assert!(!PackageId::parse("phpunit/phpunit").unwrap().is_platform());
+        assert!(!PackageId::parse("php/foo").unwrap().is_platform());
     }
 }

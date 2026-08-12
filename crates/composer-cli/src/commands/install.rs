@@ -7,7 +7,7 @@ use composer_autoload::{generate, AutoloadOptions};
 use composer_download::{default_concurrency, PackageInstaller};
 use composer_lock::ComposerLock;
 use composer_manifest::ComposerJson;
-use composer_repo::RepositoryClient;
+use composer_core::{check_requirements, Platform};
 use composer_resolver::{locked_list, resolve, ResolveOptions};
 use std::time::Instant;
 
@@ -25,6 +25,10 @@ pub struct InstallArgs {
     #[arg(long, default_value_t = true)]
     pub prefer_dist: bool,
 
+    /// Prefer VCS source installs over dist archives
+    #[arg(long)]
+    pub prefer_source: bool,
+
     /// Optimize PSR autoload into classmap
     #[arg(short = 'o', long)]
     pub optimize_autoloader: bool,
@@ -41,7 +45,7 @@ pub struct InstallArgs {
     #[arg(long)]
     pub verify_checksums: bool,
 
-    /// Ignore platform requirements (always ignored for install path today)
+    /// Ignore platform requirements (php, ext-*)
     #[arg(long)]
     pub ignore_platform_reqs: bool,
 }
@@ -62,18 +66,28 @@ pub async fn run(args: InstallArgs) -> Result<()> {
 
     let lock = if lock_path.exists() {
         info(&format!("Lock file: {}", lock_path.display()));
-        ComposerLock::load(&lock_path).context("parse composer.lock")?
+        let lock = ComposerLock::load(&lock_path).context("parse composer.lock")?;
+        let expected = composer_lock::content_hash_from_relevant(
+            &composer_manifest::relevant_content(&manifest),
+        );
+        if !lock.content_hash.is_empty() && lock.content_hash != expected {
+            warning(&format!(
+                "composer.lock content-hash mismatch (lock={}, computed={expected}) — run update",
+                lock.content_hash
+            ));
+        }
+        lock
     } else {
         warning("No composer.lock found — resolving from composer.json");
-        let client = RepositoryClient::new()?;
         let options = ResolveOptions {
             with_dev,
             prefer_stable: true,
             prefer_lowest: false,
             minimum_stability: manifest.minimum_stability().to_string(),
             concurrency,
+            ignore_platform_reqs: args.ignore_platform_reqs,
         };
-        let resolution = resolve(&client, &manifest, &options, &cwd)
+        let resolution = resolve(&manifest, &options, &cwd)
             .await
             .context("dependency resolution (PubGrub)")?;
         let lock = resolution.to_lock(&manifest);
@@ -105,11 +119,32 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         return Ok(());
     }
 
+    if !args.ignore_platform_reqs {
+        let mut platform = Platform::detect().context("detect PHP platform")?;
+        platform.apply_config_platform(manifest.config.as_ref());
+        check_requirements(&platform, &manifest.require).context("platform check")?;
+        if with_dev {
+            check_requirements(&platform, &manifest.require_dev).context("platform check (dev)")?;
+        }
+        for pkg in &packages {
+            check_requirements(&platform, &pkg.require)
+                .with_context(|| format!("platform check for {}", pkg.name))?;
+        }
+        if platform.reliable {
+            info(&format!(
+                "Platform OK (PHP {})",
+                platform.php_version().as_str()
+            ));
+        }
+    }
+
     std::fs::create_dir_all(&vendor)?;
 
+    let prefer_dist = args.prefer_dist && !args.prefer_source;
     let installer = PackageInstaller::new(concurrency, args.verify_checksums)?
         .with_project_root(&cwd)
-        .with_installer_paths(installer_paths);
+        .with_installer_paths(installer_paths)
+        .with_prefer_dist(prefer_dist);
     let refs: Vec<&composer_lock::LockedPackage> = packages.iter().collect();
     installer
         .install_all(&refs, &vendor)
@@ -118,9 +153,10 @@ pub async fn run(args: InstallArgs) -> Result<()> {
 
     let stats = installer.stats().snapshot();
     info(&format!(
-        "cache hits: {}  downloads: {}  hardlinks: {}  copies: {}  bytes: {}",
+        "cache hits: {}  downloads: {}  skipped: {}  hardlinks: {}  copies: {}  bytes: {}",
         stats.cache_hits,
         stats.downloaded,
+        stats.skipped,
         stats.hardlinks,
         stats.copies,
         composer_cache::format_bytes(stats.bytes),

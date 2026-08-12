@@ -29,3 +29,7 @@ tracing = { workspace = true }
 num_cpus = { workspace = true }
 indicatif = { workspace = true }
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tar = { workspace = true }

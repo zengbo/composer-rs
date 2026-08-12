@@ -165,6 +165,22 @@ impl ComposerJson {
         parse_repositories(self.repositories.as_ref())
     }
 
+    /// Whether Packagist is enabled (default true unless `packagist.org: false`).
+    pub fn packagist_enabled(&self) -> bool {
+        let Some(value) = &self.repositories else {
+            return true;
+        };
+        let Value::Object(map) = value else {
+            return true;
+        };
+        for (key, val) in map {
+            if (key == "packagist.org" || key == "packagist") && val.as_bool() == Some(false) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Custom installer-paths from `extra`.
     pub fn installer_paths(&self) -> InstallerPaths {
         InstallerPaths::from_extra(self.extra.as_ref())
@@ -183,28 +199,75 @@ fn parse_deps(map: &BTreeMap<String, String>) -> Result<Vec<(PackageId, VersionC
     Ok(out)
 }
 
-/// JSON fragment used for content-hash (relevant dependency fields).
+/// JSON fragment used for Composer content-hash.
+///
+/// Mirrors Composer\Package\Locker::getContentHash relevant keys and encodes
+/// compact JSON with unsorted nested objects represented via BTreeMap (sorted
+/// keys) — close enough for drift detection; exact byte match with every
+/// Composer version is not guaranteed for exotic key order.
 pub fn relevant_content(manifest: &ComposerJson) -> String {
-    let mut map = BTreeMap::new();
-    if !manifest.require.is_empty() {
-        map.insert("require", &manifest.require);
+    // Rebuild from a value map so we only include present keys (Composer style).
+    let mut relevant = BTreeMap::new();
+
+    if let Some(name) = &manifest.name {
+        relevant.insert("name".into(), Value::String(name.clone()));
     }
-    // serialize sorted
+    if let Some(version) = &manifest.version {
+        relevant.insert("version".into(), Value::String(version.clone()));
+    }
+    if !manifest.require.is_empty() {
+        relevant.insert("require".into(), map_to_object(&manifest.require));
+    }
+    if !manifest.require_dev.is_empty() {
+        relevant.insert("require-dev".into(), map_to_object(&manifest.require_dev));
+    }
+    if !manifest.conflict.is_empty() {
+        relevant.insert("conflict".into(), map_to_object(&manifest.conflict));
+    }
+    if !manifest.replace.is_empty() {
+        relevant.insert("replace".into(), map_to_object(&manifest.replace));
+    }
+    if !manifest.provide.is_empty() {
+        relevant.insert("provide".into(), map_to_object(&manifest.provide));
+    }
+    if let Some(ms) = &manifest.minimum_stability {
+        relevant.insert("minimum-stability".into(), Value::String(ms.clone()));
+    }
+    if let Some(ps) = manifest.prefer_stable {
+        relevant.insert("prefer-stable".into(), Value::Bool(ps));
+    }
+    if let Some(repos) = &manifest.repositories {
+        relevant.insert("repositories".into(), repos.clone());
+    }
+    if let Some(extra) = &manifest.extra {
+        relevant.insert("extra".into(), extra.clone());
+    }
+    // config.platform only (Composer includes just this slice of config)
+    if let Some(platform) = manifest
+        .config
+        .as_ref()
+        .and_then(|c| c.get("platform"))
+        .cloned()
+    {
+        let mut config = serde_json::Map::new();
+        config.insert("platform".into(), platform);
+        relevant.insert("config".into(), Value::Object(config));
+    }
+
+    // Compact JSON, sorted top-level keys via BTreeMap, unescaped slashes.
+    let value = Value::Object(relevant.into_iter().collect());
+    // serde_json compact encode; replace escaped slashes for closer Composer match.
+    serde_json::to_string(&value)
+        .unwrap_or_default()
+        .replace("\\/", "/")
+}
+
+fn map_to_object(map: &BTreeMap<String, String>) -> Value {
     let mut obj = serde_json::Map::new();
-    for (k, v) in &manifest.require {
+    for (k, v) in map {
         obj.insert(k.clone(), Value::String(v.clone()));
     }
-    let require = Value::Object(obj);
-    let mut root = serde_json::Map::new();
-    root.insert("require".into(), require);
-    if !manifest.require_dev.is_empty() {
-        let mut dev = serde_json::Map::new();
-        for (k, v) in &manifest.require_dev {
-            dev.insert(k.clone(), Value::String(v.clone()));
-        }
-        root.insert("require-dev".into(), Value::Object(dev));
-    }
-    serde_json::to_string(&Value::Object(root)).unwrap_or_default()
+    Value::Object(obj)
 }
 
 #[cfg(test)]
@@ -225,5 +288,20 @@ mod tests {
         let deps = m.prod_deps().unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].0.as_str(), "symfony/console");
+    }
+
+    #[test]
+    fn relevant_content_includes_stability() {
+        let m = ComposerJson {
+            name: Some("acme/app".into()),
+            require: BTreeMap::from([("php".into(), ">=8.1".into())]),
+            minimum_stability: Some("dev".into()),
+            prefer_stable: Some(true),
+            ..Default::default()
+        };
+        let s = relevant_content(&m);
+        assert!(s.contains("minimum-stability"));
+        assert!(s.contains("prefer-stable"));
+        assert!(!s.contains("\\/"));
     }
 }

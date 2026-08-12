@@ -13,3 +13,5 @@ walkdir = { workspace = true }
 blake3 = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }

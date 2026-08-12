@@ -9,8 +9,11 @@
 
 use composer_core::error::{Error, Result};
 use composer_core::hash::{content_hash, ContentHash};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
@@ -44,6 +47,8 @@ pub fn metadata_dir() -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct CasCache {
     cas_root: PathBuf,
+    /// Per-key mutexes so parallel installs of the same package serialize store().
+    store_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Default for CasCache {
@@ -56,12 +61,14 @@ impl CasCache {
     pub fn new() -> Self {
         Self {
             cas_root: cas_dir(),
+            store_locks: Arc::new(DashMap::new()),
         }
     }
 
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             cas_root: root.into(),
+            store_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -105,6 +112,17 @@ impl CasCache {
     pub fn store(&self, key: &str, source_dir: &Path) -> Result<PathBuf> {
         let hash = Self::key_hash(key);
         let dest = self.entry_path(&hash);
+
+        if self.marker_path(&hash).is_file() {
+            return Ok(dest);
+        }
+
+        let lock = self
+            .store_locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock();
 
         if self.marker_path(&hash).is_file() {
             return Ok(dest);

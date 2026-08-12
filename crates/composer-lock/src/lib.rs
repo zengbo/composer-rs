@@ -235,6 +235,20 @@ impl LockedPackage {
         self.package_type.as_deref() == Some("metapackage")
             || self.dist.is_none() && self.source.is_none()
     }
+
+    /// Whether a path-repository package should be symlinked into vendor (default: true).
+    pub fn path_symlink(&self) -> bool {
+        if let Some(extra) = &self.extra {
+            if let Some(v) = extra
+                .get("composer-rs")
+                .and_then(|v| v.get("symlink"))
+                .and_then(|v| v.as_bool())
+            {
+                return v;
+            }
+        }
+        true
+    }
 }
 
 /// Dist archive info.
@@ -269,14 +283,9 @@ pub enum License {
     Many(Vec<String>),
 }
 
-/// Compute Composer content-hash from relevant composer.json fields.
+/// Compute Composer-compatible content-hash (MD5 of relevant composer.json fields).
 pub fn content_hash_from_relevant(relevant_json: &str) -> String {
-    // Composer uses md5 of sorted relevant keys; we use blake3 hex truncated
-    // for local drift detection. When writing locks we store this hash.
-    // For max compatibility with Composer-generated locks, install does not
-    // require hash match — only warns on drift when recomputed differs.
-    let hash = blake3::hash(relevant_json.as_bytes());
-    hash.to_hex().to_string()[..32].to_string()
+    format!("{:x}", md5::compute(relevant_json.as_bytes()))
 }
 
 #[cfg(test)]
@@ -321,5 +330,50 @@ mod tests {
         let json = serde_json::to_string_pretty(&lock).unwrap();
         let parsed = ComposerLock::from_str(&json).unwrap();
         assert_eq!(parsed.packages[0].name, "foo/bar");
+    }
+
+    #[test]
+    fn path_symlink_from_extra() {
+        let mut pkg = LockedPackage {
+            name: "acme/lib".into(),
+            version: "1.0.0".into(),
+            source: None,
+            dist: Some(DistInfo {
+                dist_type: "path".into(),
+                url: "/tmp/lib".into(),
+                reference: None,
+                shasum: None,
+                mirrors: None,
+            }),
+            require: BTreeMap::new(),
+            require_dev: BTreeMap::new(),
+            package_type: Some("library".into()),
+            extra: Some(serde_json::json!({ "composer-rs": { "symlink": false } })),
+            autoload: None,
+            autoload_dev: None,
+            notification_url: None,
+            license: vec![],
+            description: None,
+            homepage: None,
+            keywords: vec![],
+            time: None,
+            replace: BTreeMap::new(),
+            provide: BTreeMap::new(),
+            conflict: BTreeMap::new(),
+            suggest: BTreeMap::new(),
+            bin: vec![],
+            abandoned: None,
+        };
+        assert!(!pkg.path_symlink());
+        pkg.extra = None;
+        assert!(pkg.path_symlink());
+    }
+
+    #[test]
+    fn content_hash_is_md5_hex() {
+        let relevant = r#"{"require":{"symfony/console":"^6.0"}}"#;
+        let hash = content_hash_from_relevant(relevant);
+        assert_eq!(hash.len(), 32);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

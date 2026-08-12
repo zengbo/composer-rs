@@ -6,7 +6,6 @@ use clap::Args;
 use composer_autoload::{generate, AutoloadOptions};
 use composer_download::{default_concurrency, PackageInstaller};
 use composer_manifest::ComposerJson;
-use composer_repo::RepositoryClient;
 use composer_resolver::{resolve, ResolveOptions};
 use std::time::Instant;
 
@@ -30,11 +29,25 @@ pub struct UpdateArgs {
     #[arg(short = 'o', long)]
     pub optimize_autoloader: bool,
 
+    #[arg(short = 'a', long)]
+    pub classmap_authoritative: bool,
+
     #[arg(long)]
     pub concurrency: Option<usize>,
 
     #[arg(long)]
     pub verify_checksums: bool,
+
+    #[arg(long)]
+    pub ignore_platform_reqs: bool,
+
+    /// Prefer dist archives (default)
+    #[arg(long, default_value_t = true)]
+    pub prefer_dist: bool,
+
+    /// Prefer VCS source installs over dist archives
+    #[arg(long)]
+    pub prefer_source: bool,
 }
 
 pub async fn run(args: UpdateArgs) -> Result<()> {
@@ -54,16 +67,16 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
     let with_dev = !args.no_dev;
 
-    let client = RepositoryClient::new()?;
     let options = ResolveOptions {
         with_dev,
         prefer_stable: args.prefer_stable || manifest.prefer_stable(),
         prefer_lowest: args.prefer_lowest,
         minimum_stability: manifest.minimum_stability().to_string(),
         concurrency,
+        ignore_platform_reqs: args.ignore_platform_reqs,
     };
 
-    let resolution = resolve(&client, &manifest, &options, &cwd)
+    let resolution = resolve(&manifest, &options, &cwd)
         .await
         .context("resolve (PubGrub)")?;
     let lock = resolution.to_lock(&manifest);
@@ -90,9 +103,11 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     success(&format!("Wrote {}", lock_path.display()));
 
     std::fs::create_dir_all(&vendor)?;
+    let prefer_dist = args.prefer_dist && !args.prefer_source;
     let installer = PackageInstaller::new(concurrency, args.verify_checksums)?
         .with_project_root(&cwd)
-        .with_installer_paths(installer_paths);
+        .with_installer_paths(installer_paths)
+        .with_prefer_dist(prefer_dist);
     let packages = composer_resolver::locked_list(&lock, with_dev);
     let refs: Vec<_> = packages.iter().collect();
     installer.install_all(&refs, &vendor).await?;
@@ -110,7 +125,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         Some(&lock),
         &AutoloadOptions {
             optimize: args.optimize_autoloader,
-            classmap_authoritative: false,
+            classmap_authoritative: args.classmap_authoritative,
             with_dev,
         },
     )?;

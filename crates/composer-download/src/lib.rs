@@ -37,6 +37,7 @@ pub struct InstallStats {
     pub cache_hits: AtomicUsize,
     pub downloaded: AtomicUsize,
     pub failed: AtomicUsize,
+    pub skipped: AtomicUsize,
     pub bytes: AtomicU64,
     pub hardlinks: AtomicU64,
     pub copies: AtomicU64,
@@ -49,6 +50,7 @@ impl InstallStats {
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             downloaded: self.downloaded.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            skipped: self.skipped.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             hardlinks: self.hardlinks.load(Ordering::Relaxed),
             copies: self.copies.load(Ordering::Relaxed),
@@ -62,6 +64,7 @@ pub struct StatsSnapshot {
     pub cache_hits: usize,
     pub downloaded: usize,
     pub failed: usize,
+    pub skipped: usize,
     pub bytes: u64,
     pub hardlinks: u64,
     pub copies: u64,
@@ -73,6 +76,7 @@ pub struct PackageInstaller {
     cache: CasCache,
     concurrency: usize,
     verify_checksums: bool,
+    prefer_dist: bool,
     stats: Arc<InstallStats>,
     project_root: PathBuf,
     installer_paths: InstallerPaths,
@@ -97,6 +101,7 @@ impl PackageInstaller {
             cache: CasCache::new(),
             concurrency: concurrency.max(1),
             verify_checksums,
+            prefer_dist: true,
             stats: Arc::new(InstallStats::default()),
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             installer_paths: InstallerPaths::default(),
@@ -115,6 +120,11 @@ impl PackageInstaller {
 
     pub fn with_installer_paths(mut self, paths: InstallerPaths) -> Self {
         self.installer_paths = paths;
+        self
+    }
+
+    pub fn with_prefer_dist(mut self, prefer_dist: bool) -> Self {
+        self.prefer_dist = prefer_dist;
         self
     }
 
@@ -140,7 +150,7 @@ impl PackageInstaller {
         for pkg in packages {
             if pkg.is_metapackage() {
                 debug!(name = %pkg.name, "skipping metapackage");
-                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
@@ -153,6 +163,7 @@ impl PackageInstaller {
             let installer_paths = self.installer_paths.clone();
             let pkg = (*pkg).clone();
             let verify = self.verify_checksums;
+            let prefer_dist = self.prefer_dist;
 
             futs.push(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
@@ -165,6 +176,7 @@ impl PackageInstaller {
                     &project_root,
                     &installer_paths,
                     verify,
+                    prefer_dist,
                 )
                 .await
             });
@@ -218,18 +230,39 @@ async fn install_one(
     project_root: &Path,
     installer_paths: &InstallerPaths,
     verify_checksums: bool,
+    prefer_dist: bool,
 ) -> Result<()> {
     let dest = package_dest(pkg, vendor_dir, project_root, installer_paths)?;
 
     // Path repository: symlink or copy from local directory
     if let Some(dist) = &pkg.dist {
         if dist.dist_type == "path" {
-            return install_path_package(pkg, &dest, Path::new(&dist.url), true, stats);
+            return install_path_package(
+                pkg,
+                &dest,
+                Path::new(&dist.url),
+                pkg.path_symlink(),
+                stats,
+            );
         }
     }
     if let Some(source) = &pkg.source {
         if source.source_type == "path" {
-            return install_path_package(pkg, &dest, Path::new(&source.url), true, stats);
+            return install_path_package(
+                pkg,
+                &dest,
+                Path::new(&source.url),
+                pkg.path_symlink(),
+                stats,
+            );
+        }
+    }
+
+    if !prefer_dist {
+        if let Some(source) = &pkg.source {
+            if source.source_type == "git" || source.source_type == "vcs" {
+                return install_vcs_package(pkg, &dest, source, stats).await;
+            }
         }
     }
 
@@ -497,22 +530,64 @@ async fn install_vcs_package(
         if let Some(parent) = cache_dir.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
-        let status = tokio::process::Command::new("git")
-            .args(["clone", "--depth", "1", &source.url])
-            .arg(&cache_dir)
+
+        // Only pass --branch for branch/tag names. Commit SHAs are not valid
+        // --branch values and would make shallow clone fail.
+        let mut clone = tokio::process::Command::new("git");
+        clone.args(["clone", "--depth", "1"]);
+        if let Some(reference) = &source.reference {
+            if is_git_branch_or_tag(reference) {
+                clone.args(["--branch", reference]);
+            }
+        }
+        clone.arg(&source.url).arg(&cache_dir);
+
+        let status = clone
             .status()
             .await
             .map_err(|e| Error::other(format!("git clone: {e}")))?;
         if !status.success() {
             return Err(Error::other(format!("git clone failed for {}", source.url)));
         }
+
         if let Some(reference) = &source.reference {
-            let _ = tokio::process::Command::new("git")
+            // For SHAs, a shallow clone of default branch may not contain the
+            // commit — fetch it explicitly when checkout fails.
+            let checkout = tokio::process::Command::new("git")
                 .args(["-C"])
                 .arg(&cache_dir)
                 .args(["checkout", reference])
                 .status()
-                .await;
+                .await
+                .map_err(|e| Error::other(format!("git checkout: {e}")))?;
+            if !checkout.success() {
+                let fetch = tokio::process::Command::new("git")
+                    .args(["-C"])
+                    .arg(&cache_dir)
+                    .args(["fetch", "--depth", "1", "origin", reference])
+                    .status()
+                    .await
+                    .map_err(|e| Error::other(format!("git fetch: {e}")))?;
+                if !fetch.success() {
+                    return Err(Error::other(format!(
+                        "git fetch {reference} failed for {}",
+                        source.url
+                    )));
+                }
+                let checkout2 = tokio::process::Command::new("git")
+                    .args(["-C"])
+                    .arg(&cache_dir)
+                    .args(["checkout", "FETCH_HEAD"])
+                    .status()
+                    .await
+                    .map_err(|e| Error::other(format!("git checkout: {e}")))?;
+                if !checkout2.success() {
+                    return Err(Error::other(format!(
+                        "git checkout {reference} failed for {}",
+                        source.url
+                    )));
+                }
+            }
         }
     }
 
@@ -529,6 +604,19 @@ async fn install_vcs_package(
     stats.copies.fetch_add(1, Ordering::Relaxed);
     debug!(name = %pkg.name, "installed from vcs");
     Ok(())
+}
+
+/// True for refs safe to pass as `git clone --branch` (not a bare commit SHA).
+fn is_git_branch_or_tag(reference: &str) -> bool {
+    let r = reference.trim();
+    if r.is_empty() {
+        return false;
+    }
+    // 7–40 hex chars → treat as commit-ish, not a branch name.
+    if (7..=40).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    true
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {

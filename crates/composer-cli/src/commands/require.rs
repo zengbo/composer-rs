@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use composer_core::PackageId;
 use composer_manifest::ComposerJson;
-use composer_repo::RepositoryClient;
+use composer_repo::RepositoryRegistry;
 
 #[derive(Args, Debug, Clone)]
 pub struct RequireArgs {
@@ -40,7 +40,7 @@ pub async fn run(args: RequireArgs) -> Result<()> {
         }
     };
 
-    let client = RepositoryClient::new()?;
+    let client = RepositoryRegistry::from_manifest(&manifest)?;
 
     for spec in &args.packages {
         let (name, constraint) = parse_package_spec(spec);
@@ -94,8 +94,12 @@ pub async fn run(args: RequireArgs) -> Result<()> {
             prefer_stable: true,
             dry_run: false,
             optimize_autoloader: false,
+            classmap_authoritative: false,
             concurrency: None,
             verify_checksums: false,
+            ignore_platform_reqs: false,
+            prefer_dist: true,
+            prefer_source: false,
         };
         super::update::run(update_args).await?;
     }

@@ -301,6 +301,102 @@ impl Default for RepositoryClient {
     }
 }
 
+/// Ordered registry of Composer repositories (custom repos first, then Packagist).
+#[derive(Clone)]
+pub struct RepositoryRegistry {
+    clients: Vec<RepositoryClient>,
+}
+
+impl RepositoryRegistry {
+    /// Build from `composer.json` repositories (respects `packagist.org: false`).
+    pub fn from_manifest(manifest: &composer_manifest::ComposerJson) -> Result<Self> {
+        let repos = manifest.repositories_list();
+        let mut clients = Vec::new();
+        let mut has_packagist = false;
+
+        for repo in &repos {
+            if let composer_manifest::Repository::Composer { url } = repo {
+                let normalized = url.trim_end_matches('/');
+                if normalized.contains("packagist.org") {
+                    has_packagist = true;
+                }
+                clients.push(RepositoryClient::with_base_url(url)?);
+            }
+        }
+
+        if manifest.packagist_enabled() && !has_packagist {
+            clients.push(RepositoryClient::new()?);
+        }
+
+        if clients.is_empty() {
+            clients.push(RepositoryClient::new()?);
+        }
+
+        Ok(Self { clients })
+    }
+
+    /// Fetch package versions, trying each repository in order.
+    pub async fn get_package_versions(
+        &self,
+        name: &PackageId,
+    ) -> Result<Vec<RemotePackageVersion>> {
+        let mut last_not_found = None;
+        for client in &self.clients {
+            match client.get_package_versions(name).await {
+                Ok(versions) if !versions.is_empty() => return Ok(versions),
+                Ok(_) => continue,
+                Err(Error::PackageNotFound(_)) => {
+                    last_not_found = Some(Error::PackageNotFound(name.to_string()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_not_found.unwrap_or_else(|| Error::PackageNotFound(name.to_string())))
+    }
+
+    /// Delegate search to the first repository client.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.clients
+            .first()
+            .ok_or_else(|| Error::other("no repository configured"))?
+            .search(query, limit)
+            .await
+    }
+
+    /// Delegate show to the registry (tries all repos).
+    pub async fn show(&self, name: &PackageId) -> Result<Vec<RemotePackageVersion>> {
+        self.get_package_versions(name).await
+    }
+
+    /// Best matching version across all repositories.
+    pub async fn find_best(
+        &self,
+        name: &PackageId,
+        constraint: &VersionConstraint,
+        prefer_stable: bool,
+        min_stability: &str,
+    ) -> Result<RemotePackageVersion> {
+        let mut last_no_match = None;
+        for client in &self.clients {
+            match client
+                .find_best(name, constraint, prefer_stable, min_stability)
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(Error::NoMatchingVersion { .. }) => {
+                    last_no_match = Some(Error::NoMatchingVersion {
+                        package: name.to_string(),
+                        constraint: constraint.to_string(),
+                    });
+                }
+                Err(Error::PackageNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_no_match.unwrap_or_else(|| Error::PackageNotFound(name.to_string())))
+    }
+}
+
 fn parse_min_stability(s: &str) -> composer_core::version::Stability {
     composer_core::version::Stability::parse(s)
 }

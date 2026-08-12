@@ -94,9 +94,35 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
 
 fn extract_tar(reader: impl Read, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
-    archive
-        .unpack(dest)
-        .map_err(|e| Error::archive(e.to_string()))?;
+    for entry in archive.entries().map_err(|e| Error::archive(e.to_string()))? {
+        let mut entry = entry.map_err(|e| Error::archive(e.to_string()))?;
+        let raw = entry
+            .path()
+            .map_err(|e| Error::archive(e.to_string()))?
+            .to_string_lossy()
+            .into_owned();
+        let out_path = safe_join(dest, &raw)?;
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| Error::io(&out_path, e))?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+
+        let mut outfile = File::create(&out_path).map_err(|e| Error::io(&out_path, e))?;
+        std::io::copy(&mut entry, &mut outfile).map_err(|e| Error::io(&out_path, e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(mode) = entry.header().mode() {
+                let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -121,4 +147,27 @@ fn safe_join(base: &Path, name: &str) -> Result<std::path::PathBuf> {
         )));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_join_blocks_parent_segments() {
+        let base = tempfile::tempdir().unwrap();
+        let err = safe_join(base.path(), "../outside.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("traversal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn safe_join_allows_normal_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let out = safe_join(base.path(), "src/Foo.php").unwrap();
+        assert!(out.starts_with(base.path()));
+        assert!(out.ends_with("Foo.php"));
+    }
 }

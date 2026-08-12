@@ -10,5 +10,4 @@ description = "composer.lock read/write for composer-rs"
 composer-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-blake3 = { workspace = true }
-hex = { workspace = true }
+md5 = { workspace = true }

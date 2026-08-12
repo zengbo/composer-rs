@@ -33,8 +33,21 @@ pub fn run(args: ValidateArgs) -> Result<()> {
     success("composer.json is valid");
 
     if !args.no_check_lock && lock_path.exists() {
-        let _lock = ComposerLock::load(&lock_path)?;
+        let lock = ComposerLock::load(&lock_path)?;
         success("composer.lock is valid JSON");
+        let expected = composer_lock::content_hash_from_relevant(
+            &composer_manifest::relevant_content(&manifest),
+        );
+        if lock.content_hash.is_empty() {
+            warning("composer.lock is missing content-hash");
+        } else if lock.content_hash != expected {
+            warning(&format!(
+                "content-hash mismatch: lock has {} but composer.json computes {expected}",
+                lock.content_hash
+            ));
+        } else {
+            success("content-hash matches composer.json");
+        }
     }
 
     Ok(())

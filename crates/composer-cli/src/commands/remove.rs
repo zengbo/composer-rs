@@ -58,8 +58,12 @@ pub async fn run(args: RemoveArgs) -> Result<()> {
             prefer_stable: true,
             dry_run: false,
             optimize_autoloader: false,
+            classmap_authoritative: false,
             concurrency: None,
             verify_checksums: false,
+            ignore_platform_reqs: false,
+            prefer_dist: true,
+            prefer_source: false,
         };
         super::update::run(update_args).await?;
     }

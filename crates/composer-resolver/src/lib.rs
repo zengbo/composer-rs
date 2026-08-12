@@ -16,11 +16,11 @@ pub use index::PackageIndex;
 pub use sources::{LocalPathPackage, SourceKind};
 
 use composer_core::error::{Error, Result};
-use composer_core::{PackageId, VersionConstraint};
+use composer_core::{PackageId, Platform, VersionConstraint};
 use composer_lock::{ComposerLock, LockedPackage};
 use composer_manifest::{ComposerJson, Repository};
-use composer_repo::RepositoryClient;
-use provider::{solve_with_pubgrub, SolveRequest};
+use composer_repo::RepositoryRegistry;
+use provider::{normalize_solution, solve_with_pubgrub, SolveRequest};
 use sources::collect_local_sources;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -34,6 +34,7 @@ pub struct ResolveOptions {
     pub prefer_lowest: bool,
     pub minimum_stability: String,
     pub concurrency: usize,
+    pub ignore_platform_reqs: bool,
 }
 
 impl Default for ResolveOptions {
@@ -44,6 +45,7 @@ impl Default for ResolveOptions {
             prefer_lowest: false,
             minimum_stability: "stable".into(),
             concurrency: 32,
+            ignore_platform_reqs: false,
         }
     }
 }
@@ -87,7 +89,6 @@ impl Resolution {
 
 /// Resolve dependencies for a project manifest.
 pub async fn resolve(
-    client: &RepositoryClient,
     manifest: &ComposerJson,
     options: &ResolveOptions,
     project_root: &Path,
@@ -131,8 +132,20 @@ pub async fn resolve(
         }
     }
 
-    // Prefetch Packagist metadata for the dependency closure.
-    prefetch_packagist(client, &mut index, &all_roots, options).await?;
+    // Prefetch remote metadata for the dependency closure.
+    let registry = RepositoryRegistry::from_manifest(manifest)?;
+    prefetch_remote(&registry, &mut index, &all_roots, options).await?;
+
+    index.register_virtual_packages();
+
+    let mut platform = Platform::detect()?;
+    platform.apply_config_platform(manifest.config.as_ref());
+    if !platform.reliable && !options.ignore_platform_reqs {
+        tracing::warn!(
+            "PHP not detected; platform filtering disabled during resolve \
+             (set COMPOSER_PLATFORM_PHP, config.platform, or --ignore-platform-reqs)"
+        );
+    }
 
     let request = SolveRequest {
         root_deps: all_roots,
@@ -141,9 +154,11 @@ pub async fn resolve(
         minimum_stability: composer_core::Stability::parse(&options.minimum_stability),
         root_replace: manifest.replace.keys().cloned().collect(),
         root_provide: manifest.provide.keys().cloned().collect(),
+        platform,
+        ignore_platform_reqs: options.ignore_platform_reqs,
     };
 
-    let selected = solve_with_pubgrub(&index, &request)?;
+    let selected = normalize_solution(solve_with_pubgrub(&index, &request)?, &index)?;
 
     // Split prod vs dev
     let mut prod_names: BTreeSet<String> = BTreeSet::new();
@@ -185,8 +200,8 @@ pub async fn resolve(
     })
 }
 
-async fn prefetch_packagist(
-    client: &RepositoryClient,
+async fn prefetch_remote(
+    registry: &RepositoryRegistry,
     index: &mut PackageIndex,
     roots: &[(PackageId, VersionConstraint)],
     options: &ResolveOptions,
@@ -231,16 +246,16 @@ async fn prefetch_packagist(
             continue;
         }
 
-        info!(count = wave.len(), "prefetching packagist metadata");
+        info!(count = wave.len(), "prefetching package metadata");
         let sem = Arc::new(tokio::sync::Semaphore::new(options.concurrency));
         let mut futs = FuturesUnordered::new();
         for name in wave {
-            let client = client.clone();
+            let registry = registry.clone();
             let sem = Arc::clone(&sem);
             futs.push(async move {
                 let _p = sem.acquire().await.ok();
                 let id = PackageId::parse(&name)?;
-                let versions = client.get_package_versions(&id).await?;
+                let versions = registry.get_package_versions(&id).await?;
                 Ok::<_, Error>((name, versions))
             });
         }
