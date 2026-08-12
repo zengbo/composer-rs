@@ -1,0 +1,15 @@
+[package]
+name = "composer-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Content-addressable package cache for composer-rs"
+
+[dependencies]
+composer-core = { workspace = true }
+directories = { workspace = true }
+walkdir = { workspace = true }
+blake3 = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }

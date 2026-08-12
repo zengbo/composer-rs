@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/composer-core",
+    "crates/composer-cache",
+    "crates/composer-lock",
+    "crates/composer-manifest",
+    "crates/composer-repo",
+    "crates/composer-resolver",
+    "crates/composer-download",
+    "crates/composer-autoload",
+    "crates/composer-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/composer-rs/composer-rs"
+authors = ["composer-rs contributors"]
+keywords = ["composer", "php", "package-manager", "dependency"]
+categories = ["development-tools", "command-line-utilities"]
+description = "High-performance Composer-compatible PHP package manager in Rust"
+
+[workspace.dependencies]
+composer-core = { path = "crates/composer-core" }
+composer-cache = { path = "crates/composer-cache" }
+composer-lock = { path = "crates/composer-lock" }
+composer-manifest = { path = "crates/composer-manifest" }
+composer-repo = { path = "crates/composer-repo" }
+composer-resolver = { path = "crates/composer-resolver" }
+composer-download = { path = "crates/composer-download" }
+composer-autoload = { path = "crates/composer-autoload" }
+
+tokio = { version = "1.43", features = ["full"] }
+futures = "0.3"
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "deflate",
+    "json",
+    "stream",
+    "http2",
+] }
+blake3 = "1.5"
+sha2 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+zip = { version = "2.2", default-features = false, features = ["deflate", "bzip2", "zstd"] }
+tar = "0.4"
+flate2 = "1.0"
+xz2 = "0.1"
+bzip2 = "0.5"
+directories = "6.0"
+walkdir = "2.5"
+tempfile = "3.15"
+num_cpus = "1.16"
+indicatif = "0.17"
+console = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2.5", features = ["serde"] }
+bytes = "1.9"
+parking_lot = "0.12"
+dashmap = "6.1"
+ahash = "0.8"
+semver = { version = "1.0", features = ["serde"] }
+regex = "1.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio-util = { version = "0.7", features = ["io"] }
+pubgrub = "0.3"
+version-ranges = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "abort"

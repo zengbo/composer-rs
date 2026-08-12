@@ -1,0 +1,18 @@
+[package]
+name = "composer-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core types for composer-rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+semver = { workspace = true }
+ahash = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
+version-ranges = { workspace = true }

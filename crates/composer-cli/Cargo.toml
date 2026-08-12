@@ -1,0 +1,37 @@
+[package]
+name = "composer-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI for composer-rs — high-performance Composer-compatible package manager"
+default-run = "composer-rs"
+
+# zig-as-linker (common in this environment) emits a harmless deprecation
+# notice ("ignoring deprecated linker optimization setting '1'") under LTO;
+# rustc surfaces linker stderr via the linker_messages lint.
+[lints.rust]
+linker_messages = "allow"
+
+[[bin]]
+name = "composer-rs"
+path = "src/main.rs"
+
+[dependencies]
+composer-core = { workspace = true }
+composer-cache = { workspace = true }
+composer-lock = { workspace = true }
+composer-manifest = { workspace = true }
+composer-repo = { workspace = true }
+composer-resolver = { workspace = true }
+composer-download = { workspace = true }
+composer-autoload = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+console = { workspace = true }
+indicatif = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+num_cpus = { workspace = true }
+serde_json = { workspace = true }

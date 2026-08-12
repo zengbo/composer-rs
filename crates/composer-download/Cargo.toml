@@ -1,0 +1,31 @@
+[package]
+name = "composer-download"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Parallel package downloader and archive extractor"
+
+[dependencies]
+composer-core = { workspace = true }
+composer-cache = { workspace = true }
+composer-lock = { workspace = true }
+composer-manifest = { workspace = true }
+blake3 = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+xz2 = { workspace = true }
+bzip2 = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+num_cpus = { workspace = true }
+indicatif = { workspace = true }
+tokio-util = { workspace = true }

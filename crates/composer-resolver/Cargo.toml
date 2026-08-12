@@ -1,0 +1,22 @@
+[package]
+name = "composer-resolver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PubGrub dependency resolver for composer-rs"
+
+[dependencies]
+composer-core = { workspace = true }
+composer-lock = { workspace = true }
+composer-manifest = { workspace = true }
+composer-repo = { workspace = true }
+composer-cache = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+pubgrub = { workspace = true }
+version-ranges = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
