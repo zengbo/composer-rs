@@ -33,6 +33,11 @@ pub fn constraint_to_ranges(constraint: &VersionConstraint) -> Ranges<ComposerVe
     acc
 }
 
+/// Allowed versions when a package `conflict`s with `constraint` (complement range).
+pub fn conflict_to_ranges(constraint: &VersionConstraint) -> Ranges<ComposerVersion> {
+    constraint_to_ranges(constraint).complement()
+}
+
 fn split_and(s: &str) -> Vec<&str> {
     if s.contains(',') {
         return s
@@ -215,5 +220,12 @@ mod tests {
         assert!(r.contains(&ComposerVersion::parse("1.5.0").unwrap()));
         assert!(r.contains(&ComposerVersion::parse("2.1.0").unwrap()));
         assert!(!r.contains(&ComposerVersion::parse("3.0.0").unwrap()));
+    }
+
+    #[test]
+    fn conflict_complement_excludes_matching_versions() {
+        let r = conflict_to_ranges(&VersionConstraint::new("^1.0"));
+        assert!(!r.contains(&ComposerVersion::parse("1.2.0").unwrap()));
+        assert!(r.contains(&ComposerVersion::parse("2.0.0").unwrap()));
     }
 }

@@ -1,11 +1,26 @@
+pub mod audit;
+pub mod bump;
 pub mod cache;
+pub mod check_platform;
+pub mod config_cmd;
+pub mod create_project;
+pub mod depends;
+pub mod diagnose;
 pub mod dump_autoload;
+pub mod exec_cmd;
+pub mod fund;
+pub mod global_cmd;
 pub mod init_cmd;
 pub mod install;
+pub mod licenses;
+pub mod outdated;
+pub mod reinstall;
 pub mod remove;
 pub mod require;
+pub mod run_script;
 pub mod search;
 pub mod show;
+pub mod status;
 pub mod update;
 pub mod validate;
 

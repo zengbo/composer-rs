@@ -128,11 +128,10 @@ pub struct PathPackageManifest {
 impl PathPackageManifest {
     pub fn load(dir: &Path) -> composer_core::Result<Self> {
         let path = dir.join("composer.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| composer_core::Error::io(&path, e))?;
-        serde_json::from_str(&text).map_err(|e| {
-            composer_core::Error::Manifest(format!("{}: {e}", path.display()))
-        })
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| composer_core::Error::io(&path, e))?;
+        serde_json::from_str(&text)
+            .map_err(|e| composer_core::Error::Manifest(format!("{}: {e}", path.display())))
     }
 }
 

@@ -10,6 +10,7 @@ description = "PubGrub dependency resolver for composer-rs"
 composer-core = { workspace = true }
 composer-lock = { workspace = true }
 composer-manifest = { workspace = true }
+composer-auth = { workspace = true }
 composer-repo = { workspace = true }
 composer-cache = { workspace = true }
 tokio = { workspace = true }
@@ -24,4 +25,6 @@ blake3 = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 composer-manifest = { workspace = true }
+composer-auth = { workspace = true }
 tokio = { workspace = true }
+url = { workspace = true }

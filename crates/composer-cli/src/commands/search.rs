@@ -1,9 +1,11 @@
 //! `composer-rs search`
 
-use super::{header, success};
-use anyhow::{bail, Result};
+use super::{header, project_paths, success};
+use anyhow::{Result, bail};
 use clap::Args;
-use composer_repo::RepositoryClient;
+use composer_auth::AuthStore;
+use composer_manifest::ComposerJson;
+use composer_repo::RepositoryRegistry;
 
 #[derive(Args, Debug, Clone)]
 pub struct SearchArgs {
@@ -21,8 +23,22 @@ pub async fn run(args: SearchArgs) -> Result<()> {
     let q = args.query.join(" ");
     header(&format!("Search: {q}"));
 
-    let client = RepositoryClient::new()?;
-    let results = client.search(&q, args.limit).await?;
+    let (cwd, json_path, _) = project_paths()?;
+    let auth = AuthStore::load(Some(&cwd)).unwrap_or_default();
+
+    let results = if json_path.exists() {
+        let manifest = ComposerJson::load(&json_path)?;
+        let registry = RepositoryRegistry::from_manifest_auth(&manifest, auth)?;
+        registry.search(&q, args.limit).await?
+    } else {
+        // No project: search public Packagist with global/env auth if any.
+        let client = composer_repo::RepositoryClient::with_base_url_auth(
+            "https://repo.packagist.org",
+            auth,
+        )?;
+        client.search(&q, args.limit).await?
+    };
+
     if results.is_empty() {
         println!("No results.");
         return Ok(());

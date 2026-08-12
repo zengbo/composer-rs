@@ -15,12 +15,13 @@ mod sources;
 pub use index::PackageIndex;
 pub use sources::{LocalPathPackage, SourceKind};
 
+use composer_auth::AuthStore;
 use composer_core::error::{Error, Result};
 use composer_core::{PackageId, Platform, VersionConstraint};
 use composer_lock::{ComposerLock, LockedPackage};
 use composer_manifest::{ComposerJson, Repository};
 use composer_repo::RepositoryRegistry;
-use provider::{normalize_solution, solve_with_pubgrub, SolveRequest};
+use provider::{SolveRequest, normalize_solution, solve_with_pubgrub};
 use sources::collect_local_sources;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -47,6 +48,8 @@ pub struct ResolveOptions {
     pub minimum_stability: String,
     pub concurrency: usize,
     pub ignore_platform_reqs: bool,
+    /// Per-requirement ignore patterns (e.g. `ext-xdebug`, `ext-*`).
+    pub ignore_platform_req: Vec<String>,
     /// When non-empty, only these packages (see [`UpdateDeps`]) may change version;
     /// other locked packages stay pinned. Requires `existing_lock` in `resolve`.
     pub packages_to_update: Vec<String>,
@@ -63,6 +66,7 @@ impl Default for ResolveOptions {
             minimum_stability: "stable".into(),
             concurrency: 32,
             ignore_platform_reqs: false,
+            ignore_platform_req: Vec::new(),
             packages_to_update: Vec::new(),
             update_deps: UpdateDeps::OnlyListed,
         }
@@ -158,7 +162,9 @@ pub async fn resolve(
     }
 
     // Prefetch remote metadata for the dependency closure.
-    let registry = RepositoryRegistry::from_manifest(manifest)?;
+    // Load project-local auth.json so private Composer repos work during resolve/require.
+    let auth = AuthStore::load(Some(project_root)).unwrap_or_default();
+    let registry = RepositoryRegistry::from_manifest_auth(manifest, auth)?;
     prefetch_remote(&registry, &mut index, &all_roots, options).await?;
 
     if let Some(lock) = existing_lock {
@@ -201,6 +207,7 @@ pub async fn resolve(
         root_provide: manifest.provide.keys().cloned().collect(),
         platform,
         ignore_platform_reqs: options.ignore_platform_reqs,
+        ignore_platform_req: options.ignore_platform_req.clone(),
     };
 
     let selected = normalize_solution(solve_with_pubgrub(&index, &request)?, &index)?;
@@ -271,8 +278,7 @@ async fn prefetch_remote(
                     for v in versions {
                         for dep in v.require.keys() {
                             let id = PackageId::parse(dep).ok();
-                            if id.as_ref().is_some_and(|p| !p.is_platform())
-                                && !seen.contains(dep)
+                            if id.as_ref().is_some_and(|p| !p.is_platform()) && !seen.contains(dep)
                             {
                                 queue.push_back(dep.clone());
                             }
@@ -557,12 +563,7 @@ mod partial_update_tests {
         // require-dev dep that is NOT a root requirement (edge case in lock metadata)
         let lock = ComposerLock {
             packages: vec![
-                locked_full(
-                    "vendor/a",
-                    "1.0.0",
-                    &[],
-                    &[("vendor/test-util", "^1.0")],
-                ),
+                locked_full("vendor/a", "1.0.0", &[], &[("vendor/test-util", "^1.0")]),
                 locked("vendor/test-util", "1.0.0", &[]),
             ],
             ..Default::default()

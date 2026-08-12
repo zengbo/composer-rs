@@ -320,6 +320,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "composer-auth"
+version = "0.1.0"
+dependencies = [
+ "composer-core",
+ "directories",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "composer-autoload"
 version = "0.1.0"
 dependencies = [
@@ -353,6 +367,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "composer-auth",
  "composer-autoload",
  "composer-cache",
  "composer-core",
@@ -361,13 +376,21 @@ dependencies = [
  "composer-manifest",
  "composer-repo",
  "composer-resolver",
+ "composer-scripts",
  "console",
+ "directories",
  "indicatif",
  "num_cpus",
+ "reqwest",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "walkdir",
+ "wiremock",
 ]
 
 [[package]]
@@ -392,12 +415,14 @@ dependencies = [
  "blake3",
  "bytes",
  "bzip2",
+ "composer-auth",
  "composer-autoload",
  "composer-cache",
  "composer-core",
  "composer-lock",
  "composer-manifest",
  "composer-resolver",
+ "composer-scripts",
  "flate2",
  "futures",
  "hex",
@@ -441,6 +466,7 @@ name = "composer-repo"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "composer-auth",
  "composer-cache",
  "composer-core",
  "composer-lock",
@@ -459,6 +485,7 @@ name = "composer-resolver"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "composer-auth",
  "composer-cache",
  "composer-core",
  "composer-lock",
@@ -471,8 +498,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "version-ranges",
  "wiremock",
+]
+
+[[package]]
+name = "composer-scripts"
+version = "0.1.0"
+dependencies = [
+ "composer-core",
+ "composer-manifest",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

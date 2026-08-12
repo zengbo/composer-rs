@@ -11,6 +11,7 @@ composer-core = { workspace = true }
 composer-cache = { workspace = true }
 composer-lock = { workspace = true }
 composer-manifest = { workspace = true }
+composer-auth = { workspace = true }
 blake3 = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
@@ -29,6 +30,7 @@ tracing = { workspace = true }
 num_cpus = { workspace = true }
 indicatif = { workspace = true }
 tokio-util = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -38,6 +40,7 @@ wiremock = { workspace = true }
 composer-manifest = { workspace = true }
 composer-resolver = { workspace = true }
 composer-autoload = { workspace = true }
+composer-scripts = { workspace = true }
 composer-lock = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

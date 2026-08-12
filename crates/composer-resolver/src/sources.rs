@@ -3,9 +3,7 @@
 use composer_core::error::{Error, Result};
 use composer_core::{AutoloadConfig, ComposerVersion};
 use composer_lock::{DistInfo, LockedPackage, SourceInfo};
-use composer_manifest::{
-    resolve_path_url, PathPackageManifest, Repository,
-};
+use composer_manifest::{PathPackageManifest, Repository, resolve_path_url};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -103,10 +101,7 @@ pub struct LocalSources {
 }
 
 /// Discover packages from path and VCS repositories.
-pub fn collect_local_sources(
-    project_root: &Path,
-    repos: &[Repository],
-) -> Result<LocalSources> {
+pub fn collect_local_sources(project_root: &Path, repos: &[Repository]) -> Result<LocalSources> {
     let mut out = LocalSources::default();
     for repo in repos {
         match repo {
@@ -121,9 +116,8 @@ pub fn collect_local_sources(
                     .version
                     .clone()
                     .unwrap_or_else(|| "dev-main".into());
-                let version = ComposerVersion::parse(&version_str).unwrap_or_else(|_| {
-                    ComposerVersion::parse("dev-main").expect("dev-main")
-                });
+                let version = ComposerVersion::parse(&version_str)
+                    .unwrap_or_else(|_| ComposerVersion::parse("dev-main").expect("dev-main"));
                 debug!(name = %manifest.name, path = %abs.display(), "path package");
                 out.path_packages.push(LocalPathPackage {
                     name: manifest.name,
@@ -143,14 +137,12 @@ pub fn collect_local_sources(
                     vcs_reference: None,
                 });
             }
-            Repository::Vcs { url } => {
-                match checkout_vcs(url) {
-                    Ok(pkg) => out.vcs_packages.push(pkg),
-                    Err(e) => {
-                        warn!(url = %url, error = %e, "failed to load vcs repository");
-                    }
+            Repository::Vcs { url } => match checkout_vcs(url) {
+                Ok(pkg) => out.vcs_packages.push(pkg),
+                Err(e) => {
+                    warn!(url = %url, error = %e, "failed to load vcs repository");
                 }
-            }
+            },
             _ => {}
         }
     }
@@ -199,8 +191,8 @@ fn checkout_vcs(url: &str) -> Result<LocalPathPackage> {
         .version
         .clone()
         .unwrap_or_else(|| "dev-main".into());
-    let version =
-        ComposerVersion::parse(&version_str).unwrap_or_else(|_| ComposerVersion::parse("dev-main").unwrap());
+    let version = ComposerVersion::parse(&version_str)
+        .unwrap_or_else(|_| ComposerVersion::parse("dev-main").unwrap());
 
     Ok(LocalPathPackage {
         name: manifest.name,

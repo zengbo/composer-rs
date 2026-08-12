@@ -1,7 +1,7 @@
 //! `composer-rs init`
 
 use super::{header, project_paths, success};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Args;
 use composer_manifest::ComposerJson;
 use std::collections::BTreeMap;
@@ -35,9 +35,14 @@ pub fn run(args: InitArgs) -> Result<()> {
         );
     }
 
-    let name = args
-        .name
-        .unwrap_or_else(|| format!("vendor/{}", cwd.file_name().and_then(|s| s.to_str()).unwrap_or("project")));
+    let name = args.name.unwrap_or_else(|| {
+        format!(
+            "vendor/{}",
+            cwd.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("project")
+        )
+    });
 
     let mut require = BTreeMap::new();
     require.insert("php".into(), ">=8.1".into());

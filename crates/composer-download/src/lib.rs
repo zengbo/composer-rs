@@ -3,12 +3,15 @@
 #![deny(unsafe_code)]
 
 mod archive;
+mod bins;
 mod extract;
 
 pub use archive::ArchiveType;
+pub use bins::install_bins;
 pub use extract::extract_archive;
 
-use composer_cache::{archives_dir, CasCache, InstallKind};
+use composer_auth::AuthStore;
+use composer_cache::{CasCache, InstallKind, archives_dir};
 use composer_core::error::{Error, Result};
 use composer_lock::LockedPackage;
 use composer_manifest::InstallerPaths;
@@ -16,8 +19,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -80,6 +83,7 @@ pub struct PackageInstaller {
     stats: Arc<InstallStats>,
     project_root: PathBuf,
     installer_paths: InstallerPaths,
+    auth: AuthStore,
 }
 
 impl PackageInstaller {
@@ -105,7 +109,13 @@ impl PackageInstaller {
             stats: Arc::new(InstallStats::default()),
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             installer_paths: InstallerPaths::default(),
+            auth: AuthStore::default(),
         })
+    }
+
+    pub fn with_auth(mut self, auth: AuthStore) -> Self {
+        self.auth = auth;
+        self
     }
 
     pub fn with_cache(mut self, cache: CasCache) -> Self {
@@ -137,11 +147,7 @@ impl PackageInstaller {
     }
 
     /// Install many locked packages into `vendor_dir` in parallel.
-    pub async fn install_all(
-        &self,
-        packages: &[&LockedPackage],
-        vendor_dir: &Path,
-    ) -> Result<()> {
+    pub async fn install_all(&self, packages: &[&LockedPackage], vendor_dir: &Path) -> Result<()> {
         let sem = Arc::new(Semaphore::new(self.concurrency));
         let mut futs = FuturesUnordered::new();
 
@@ -164,6 +170,7 @@ impl PackageInstaller {
             let pkg = (*pkg).clone();
             let verify = self.verify_checksums;
             let prefer_dist = self.prefer_dist;
+            let auth = self.auth.clone();
 
             futs.push(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
@@ -177,6 +184,7 @@ impl PackageInstaller {
                     &installer_paths,
                     verify,
                     prefer_dist,
+                    &auth,
                 )
                 .await
             });
@@ -211,11 +219,9 @@ fn package_dest(
     project_root: &Path,
     installer_paths: &InstallerPaths,
 ) -> Result<PathBuf> {
-    if let Some(custom) = installer_paths.resolve(
-        project_root,
-        &pkg.name,
-        pkg.package_type.as_deref(),
-    ) {
+    if let Some(custom) =
+        installer_paths.resolve(project_root, &pkg.name, pkg.package_type.as_deref())
+    {
         return Ok(custom);
     }
     Ok(vendor_dir.join(pkg.package_id()?.install_path()))
@@ -231,56 +237,98 @@ async fn install_one(
     installer_paths: &InstallerPaths,
     verify_checksums: bool,
     prefer_dist: bool,
+    auth: &AuthStore,
 ) -> Result<()> {
     let dest = package_dest(pkg, vendor_dir, project_root, installer_paths)?;
 
     // Path repository: symlink or copy from local directory
-    if let Some(dist) = &pkg.dist {
+    let result = if let Some(dist) = &pkg.dist {
         if dist.dist_type == "path" {
-            return install_path_package(
-                pkg,
-                &dest,
-                Path::new(&dist.url),
-                pkg.path_symlink(),
-                stats,
-            );
+            install_path_package(pkg, &dest, Path::new(&dist.url), pkg.path_symlink(), stats)
+        } else if !prefer_dist {
+            if let Some(source) = &pkg.source {
+                if source.source_type == "git" || source.source_type == "vcs" {
+                    install_vcs_package(pkg, &dest, source, stats).await
+                } else if pkg.dist_url().is_some() {
+                    install_dist_package(http, cache, stats, pkg, &dest, verify_checksums, auth)
+                        .await
+                } else {
+                    Err(Error::other(format!(
+                        "package {} has no installable source",
+                        pkg.name
+                    )))
+                }
+            } else if pkg.dist_url().is_some() {
+                install_dist_package(http, cache, stats, pkg, &dest, verify_checksums, auth).await
+            } else {
+                Err(Error::other(format!(
+                    "package {} has no dist URL and no installable source",
+                    pkg.name
+                )))
+            }
+        } else if pkg.dist_url().is_some() {
+            install_dist_package(http, cache, stats, pkg, &dest, verify_checksums, auth).await
+        } else if let Some(source) = &pkg.source {
+            if source.source_type == "git" || source.source_type == "vcs" {
+                install_vcs_package(pkg, &dest, source, stats).await
+            } else {
+                Err(Error::other(format!(
+                    "package {} has no dist URL and no installable source",
+                    pkg.name
+                )))
+            }
+        } else {
+            Err(Error::other(format!(
+                "package {} has no dist URL and no installable source",
+                pkg.name
+            )))
         }
-    }
-    if let Some(source) = &pkg.source {
+    } else if let Some(source) = &pkg.source {
         if source.source_type == "path" {
-            return install_path_package(
+            install_path_package(
                 pkg,
                 &dest,
                 Path::new(&source.url),
                 pkg.path_symlink(),
                 stats,
-            );
+            )
+        } else if source.source_type == "git" || source.source_type == "vcs" {
+            install_vcs_package(pkg, &dest, source, stats).await
+        } else {
+            Err(Error::other(format!(
+                "package {} has no dist URL and no installable source",
+                pkg.name
+            )))
         }
-    }
+    } else {
+        Err(Error::other(format!(
+            "package {} has no dist URL and no installable source",
+            pkg.name
+        )))
+    };
 
-    if !prefer_dist {
-        if let Some(source) = &pkg.source {
-            if source.source_type == "git" || source.source_type == "vcs" {
-                return install_vcs_package(pkg, &dest, source, stats).await;
-            }
-        }
+    if result.is_ok() {
+        write_install_marker(pkg, &dest)?;
     }
+    result
+}
 
-    // Prefer dist archives (Packagist zipballs) over VCS clones — much faster.
-    if pkg.dist_url().is_some() {
-        return install_dist_package(http, cache, stats, pkg, &dest, verify_checksums).await;
+/// Marker written into each package dir for `composer-rs status` integrity checks.
+pub fn write_install_marker(pkg: &LockedPackage, dest: &Path) -> Result<()> {
+    if !dest.exists() {
+        return Ok(());
     }
-
-    if let Some(source) = &pkg.source {
-        if source.source_type == "git" || source.source_type == "vcs" {
-            return install_vcs_package(pkg, &dest, source, stats).await;
-        }
-    }
-
-    Err(Error::other(format!(
-        "package {} has no dist URL and no installable source",
-        pkg.name
-    )))
+    // Symlinked path packages: still write marker next to target if possible
+    let marker = dest.join(".composer-rs-installed");
+    let body = serde_json::json!({
+        "name": pkg.name,
+        "version": pkg.version,
+        "cache_key": pkg.cache_key(),
+        "reference": pkg.dist.as_ref().and_then(|d| d.reference.clone())
+            .or_else(|| pkg.source.as_ref().and_then(|s| s.reference.clone())),
+    });
+    std::fs::write(&marker, body.to_string() + "\n").map_err(|e| Error::io(&marker, e))?;
+    Ok(())
 }
 
 async fn install_dist_package(
@@ -290,6 +338,7 @@ async fn install_dist_package(
     pkg: &LockedPackage,
     dest: &Path,
     verify_checksums: bool,
+    auth: &AuthStore,
 ) -> Result<()> {
     let key = pkg.cache_key();
 
@@ -303,12 +352,31 @@ async fn install_dist_package(
         return Ok(());
     }
 
-    let url = pkg
-        .dist_url()
-        .ok_or_else(|| Error::other(format!("package {} has no dist URL", pkg.name)))?
-        .to_string();
+    let urls = dist_urls(pkg);
+    if urls.is_empty() {
+        return Err(Error::other(format!(
+            "package {} has no dist URL",
+            pkg.name
+        )));
+    }
 
-    let archive_path = download_to_archives(http, &url, &pkg.name).await?;
+    let mut last_err = None;
+    let mut archive_path = None;
+    for url in &urls {
+        match download_to_archives(http, url, &pkg.name, auth).await {
+            Ok(p) => {
+                archive_path = Some(p);
+                break;
+            }
+            Err(e) => {
+                warn!(package = %pkg.name, %url, error = %e, "dist download failed, trying next mirror");
+                last_err = Some(e);
+            }
+        }
+    }
+    let archive_path = archive_path.ok_or_else(|| {
+        last_err.unwrap_or_else(|| Error::other(format!("package {} has no dist URL", pkg.name)))
+    })?;
     let bytes = std::fs::metadata(&archive_path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -348,13 +416,38 @@ async fn install_dist_package(
     Ok(())
 }
 
+/// Primary dist URL plus any `dist.mirrors` entries (Composer failover list).
+fn dist_urls(pkg: &LockedPackage) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(u) = pkg.dist_url() {
+        urls.push(u.to_string());
+    }
+    if let Some(dist) = &pkg.dist {
+        if let Some(mirrors) = &dist.mirrors {
+            for m in mirrors {
+                if let Some(u) = m.as_str() {
+                    if !urls.iter().any(|x| x == u) {
+                        urls.push(u.to_string());
+                    }
+                } else if let Some(u) = m.get("url").and_then(|v| v.as_str()) {
+                    if !urls.iter().any(|x| x == u) {
+                        urls.push(u.to_string());
+                    }
+                }
+            }
+        }
+    }
+    urls
+}
+
 async fn download_to_archives(
     http: &reqwest::Client,
     url: &str,
     package_name: &str,
+    auth: &AuthStore,
 ) -> Result<PathBuf> {
     let dir = archives_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| Error::io(dir.as_path(), e))?;
 
     let hash = blake3::hash(url.as_bytes());
     let ext = guess_extension(url);
@@ -371,7 +464,7 @@ async fn download_to_archives(
 
     loop {
         attempt += 1;
-        match download_file(http, url, &partial).await {
+        match download_file(http, url, &partial, auth).await {
             Ok(()) => {
                 std::fs::rename(&partial, &path).map_err(|e| Error::io(&path, e))?;
                 return Ok(path);
@@ -391,13 +484,18 @@ async fn download_to_archives(
     }
 }
 
-async fn download_file(http: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
+async fn download_file(
+    http: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    auth: &AuthStore,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
 
-    let resp = http
-        .get(url)
+    let builder = auth.apply_to_request(url, http.get(url));
+    let resp = builder
         .send()
         .await
         .map_err(|e| Error::download(url, e.to_string()))?;
@@ -517,7 +615,11 @@ async fn install_vcs_package(
     stats: &InstallStats,
 ) -> Result<()> {
     // Prefer a cache checkout keyed by URL; fall back to fresh clone into dest.
-    let cache_key = format!("vcs:{}@{}", source.url, source.reference.as_deref().unwrap_or("HEAD"));
+    let cache_key = format!(
+        "vcs:{}@{}",
+        source.url,
+        source.reference.as_deref().unwrap_or("HEAD")
+    );
     let hash = blake3::hash(cache_key.as_bytes());
     let cache_dir = composer_cache::cache_root()
         .join("vcs")
@@ -672,4 +774,70 @@ fn unwrap_single_root(extract_root: &Path) -> Result<PathBuf> {
         }
     }
     Ok(extract_root.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use composer_lock::{DistInfo, LockedPackage};
+    use std::collections::BTreeMap;
+
+    fn pkg_with_mirrors(url: &str, mirrors: Option<Vec<serde_json::Value>>) -> LockedPackage {
+        LockedPackage {
+            name: "acme/lib".into(),
+            version: "1.0.0".into(),
+            source: None,
+            dist: Some(DistInfo {
+                dist_type: "zip".into(),
+                url: url.into(),
+                reference: Some("abc".into()),
+                shasum: None,
+                mirrors,
+            }),
+            require: BTreeMap::new(),
+            require_dev: BTreeMap::new(),
+            package_type: Some("library".into()),
+            extra: None,
+            autoload: None,
+            autoload_dev: None,
+            notification_url: None,
+            license: vec![],
+            description: None,
+            homepage: None,
+            keywords: vec![],
+            time: None,
+            replace: BTreeMap::new(),
+            provide: BTreeMap::new(),
+            conflict: BTreeMap::new(),
+            suggest: BTreeMap::new(),
+            bin: vec![],
+            abandoned: None,
+        }
+    }
+
+    #[test]
+    fn dist_urls_primary_then_string_and_object_mirrors() {
+        let pkg = pkg_with_mirrors(
+            "https://primary.example/a.zip",
+            Some(vec![
+                serde_json::json!("https://mirror.example/a.zip"),
+                serde_json::json!({"url": "https://mirror2.example/a.zip"}),
+                serde_json::json!("https://primary.example/a.zip"),
+            ]),
+        );
+        assert_eq!(
+            dist_urls(&pkg),
+            vec![
+                "https://primary.example/a.zip",
+                "https://mirror.example/a.zip",
+                "https://mirror2.example/a.zip",
+            ]
+        );
+    }
+
+    #[test]
+    fn dist_urls_without_mirrors_is_just_primary() {
+        let pkg = pkg_with_mirrors("https://primary.example/a.zip", None);
+        assert_eq!(dist_urls(&pkg), vec!["https://primary.example/a.zip"]);
+    }
 }

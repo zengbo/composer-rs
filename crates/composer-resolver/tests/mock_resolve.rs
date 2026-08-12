@@ -3,9 +3,9 @@
 
 use composer_lock::{ComposerLock, DistInfo, LockedPackage};
 use composer_manifest::ComposerJson;
-use composer_resolver::{resolve, ResolveOptions, UpdateDeps};
+use composer_resolver::{ResolveOptions, UpdateDeps, resolve};
 use std::collections::BTreeMap;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{basic_auth, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Serialize mutations of `COMPOSER_RS_CACHE` without holding `std::sync` locks across await.
@@ -54,6 +54,7 @@ fn opts(partial: &[&str], update_deps: UpdateDeps) -> ResolveOptions {
         minimum_stability: "stable".into(),
         concurrency: 4,
         ignore_platform_reqs: false,
+        ignore_platform_req: Vec::new(),
         packages_to_update: partial.iter().map(|s| (*s).to_string()).collect(),
         update_deps,
     }
@@ -203,9 +204,14 @@ async fn resolve_package_from_mock_repository() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::write(tmp.path().join("composer.json"), &manifest_json).unwrap();
 
-    let resolution = resolve(&manifest, &opts(&[], UpdateDeps::OnlyListed), tmp.path(), None)
-        .await
-        .expect("resolve succeeds");
+    let resolution = resolve(
+        &manifest,
+        &opts(&[], UpdateDeps::OnlyListed),
+        tmp.path(),
+        None,
+    )
+    .await
+    .expect("resolve succeeds");
 
     assert_eq!(resolution.packages.len(), 1);
     assert_eq!(resolution.packages[0].name, "acme/foo");
@@ -544,4 +550,97 @@ async fn partial_update_with_w_walks_require_dev_in_dev_tree() {
         .collect();
     assert_eq!(wall.get("acme/phpunit"), Some(&"2.0.0"));
     assert_eq!(wall.get("acme/phpunit-util"), Some(&"2.0.0"));
+}
+
+/// Project-local `auth.json` must be loaded during resolve (private Composer repos).
+#[tokio::test]
+async fn resolve_uses_project_auth_json() {
+    let _cache = CacheEnvGuard::new().await;
+    let server = MockServer::start().await;
+
+    let p2 = r#"{
+        "packages": {
+            "acme/private": [
+                {
+                    "version": "1.0.0",
+                    "version_normalized": "1.0.0.0",
+                    "dist": {
+                        "type": "zip",
+                        "url": "https://example.com/private-1.0.0.zip",
+                        "reference": "p1"
+                    },
+                    "require": { "php": ">=8.1" },
+                    "type": "library"
+                }
+            ]
+        }
+    }"#;
+
+    Mock::given(method("GET"))
+        .and(path("/p2/acme/private.json"))
+        .and(basic_auth("proj-user", "proj-pass"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(p2))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/p2/acme/private.json"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host = {
+        let u = url::Url::parse(&server.uri()).unwrap();
+        match u.port() {
+            Some(p) => format!("{}:{}", u.host_str().unwrap(), p),
+            None => u.host_str().unwrap().to_string(),
+        }
+    };
+
+    let auth_json = format!(
+        r#"{{
+            "http-basic": {{
+                "{host}": {{
+                    "username": "proj-user",
+                    "password": "proj-pass"
+                }}
+            }}
+        }}"#
+    );
+    std::fs::write(tmp.path().join("auth.json"), auth_json).unwrap();
+
+    let manifest_json = format!(
+        r#"{{
+            "name": "acme/app",
+            "require": {{
+                "php": ">=8.1",
+                "acme/private": "^1.0"
+            }},
+            "repositories": {{
+                "private": {{ "type": "composer", "url": "{}/" }},
+                "packagist.org": false
+            }},
+            "config": {{
+                "platform": {{ "php": "8.2.0" }}
+            }}
+        }}"#,
+        server.uri()
+    );
+    std::fs::write(tmp.path().join("composer.json"), &manifest_json).unwrap();
+    let manifest = ComposerJson::from_str(&manifest_json).unwrap();
+
+    let resolution = resolve(
+        &manifest,
+        &opts(&[], UpdateDeps::OnlyListed),
+        tmp.path(),
+        None,
+    )
+    .await
+    .expect("resolve with project auth.json");
+
+    assert_eq!(resolution.packages.len(), 1);
+    assert_eq!(resolution.packages[0].name, "acme/private");
+    assert_eq!(resolution.packages[0].version, "1.0.0");
 }

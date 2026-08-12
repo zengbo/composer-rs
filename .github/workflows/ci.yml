@@ -11,24 +11,43 @@ env:
 
 jobs:
   test:
+    name: test (rust ${{ matrix.rust }}, php ${{ matrix.php }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85"]
+        php: ["8.2.0", "8.1.0"]
+        include:
+          - rust: stable
+            php: "8.2.0"
+            extra: lint
+    env:
+      COMPOSER_PLATFORM_PHP: ${{ matrix.php }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}-${{ matrix.php }}
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Format + Clippy
+        if: matrix.extra == 'lint'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets
-
-      - name: Test
+      - name: Test workspace
         run: cargo test --workspace
 
+      - name: Test with --no-dev style flags (unit)
+        run: cargo test -p composer-resolver --lib
+
       - name: Build release
+        if: matrix.rust == 'stable' && matrix.php == '8.2.0'
         run: cargo build --release -p composer-cli

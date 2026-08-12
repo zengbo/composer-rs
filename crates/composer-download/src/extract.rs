@@ -18,7 +18,10 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
 
     match kind {
         ArchiveType::Zip => extract_zip(archive, dest),
-        ArchiveType::Tar => extract_tar(File::open(archive).map_err(|e| Error::io(archive, e))?, dest),
+        ArchiveType::Tar => extract_tar(
+            File::open(archive).map_err(|e| Error::io(archive, e))?,
+            dest,
+        ),
         ArchiveType::TarGz => {
             let file = File::open(archive).map_err(|e| Error::io(archive, e))?;
             extract_tar(GzDecoder::new(file), dest)
@@ -61,9 +64,7 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(file).map_err(|e| Error::archive(e.to_string()))?;
 
     for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| Error::archive(e.to_string()))?;
+        let mut entry = zip.by_index(i).map_err(|e| Error::archive(e.to_string()))?;
         let name = entry.name().to_string();
 
         // Zip-slip protection
@@ -94,7 +95,10 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
 
 fn extract_tar(reader: impl Read, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
-    for entry in archive.entries().map_err(|e| Error::archive(e.to_string()))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| Error::archive(e.to_string()))?
+    {
         let mut entry = entry.map_err(|e| Error::archive(e.to_string()))?;
         let raw = entry
             .path()

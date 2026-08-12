@@ -1,8 +1,8 @@
 //! Runtime platform detection and requirement checking (`php`, `ext-*`, …).
 
+use crate::AHashSet;
 use crate::error::{Error, Result};
 use crate::version::{ComposerVersion, VersionConstraint};
-use crate::AHashSet;
 use serde_json::Value;
 use std::process::Command;
 
@@ -162,6 +162,25 @@ impl Platform {
     }
 }
 
+/// Whether a platform package name matches an `--ignore-platform-req` pattern.
+///
+/// Patterns may be exact (`ext-xdebug`, `php`) or end with `*` (`ext-*`, `php*`).
+/// A trailing `+` (Composer upper-bound ignore) is accepted but treated as full ignore.
+pub fn platform_req_ignored(name: &str, patterns: &[String]) -> bool {
+    for pat in patterns {
+        let pat = pat.trim_end_matches('+');
+        if pat == name {
+            return true;
+        }
+        if let Some(prefix) = pat.strip_suffix('*') {
+            if name.starts_with(prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check all platform requirements on a dependency map.
 ///
 /// When the platform is unreliable (no PHP, no overrides), returns an error
@@ -170,9 +189,19 @@ pub fn check_requirements(
     platform: &Platform,
     require: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
+    check_requirements_filtered(platform, require, &[])
+}
+
+/// Like [`check_requirements`], but skips names matching `ignore_patterns`.
+pub fn check_requirements_filtered(
+    platform: &Platform,
+    require: &std::collections::BTreeMap<String, String>,
+    ignore_patterns: &[String],
+) -> Result<()> {
     let platform_reqs: Vec<_> = require
         .iter()
         .filter(|(name, _)| crate::PackageId::parse(name).is_ok_and(|id| id.is_platform()))
+        .filter(|(name, _)| !platform_req_ignored(name, ignore_patterns))
         .collect();
 
     if platform_reqs.is_empty() {

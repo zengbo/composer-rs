@@ -1,18 +1,20 @@
 //! `composer-rs update`
 
 use super::{format_duration, header, info, project_paths, success, vendor_dir};
-use anyhow::{bail, Context, Result};
+use crate::hooks::{link_bins, run_lifecycle, warn_unapproved_plugins};
+use anyhow::{Context, Result, bail};
 use clap::Args;
-use composer_autoload::{generate, AutoloadOptions};
-use composer_download::{default_concurrency, PackageInstaller};
+use composer_auth::AuthStore;
+use composer_autoload::{AutoloadOptions, generate};
+use composer_core::{Platform, check_requirements_filtered};
+use composer_download::{PackageInstaller, default_concurrency};
 use composer_manifest::ComposerJson;
-use composer_core::{check_requirements, Platform};
-use composer_resolver::{resolve, ResolveOptions, UpdateDeps};
+use composer_resolver::{ResolveOptions, UpdateDeps, resolve};
+use composer_scripts::ScriptEvent;
 use std::time::Instant;
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateArgs {
-    /// Packages to update (default: all)
     pub packages: Vec<String>,
 
     #[arg(long)]
@@ -42,21 +44,33 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub ignore_platform_reqs: bool,
 
-    /// Prefer dist archives (default)
+    #[arg(long = "ignore-platform-req", value_name = "REQ")]
+    pub ignore_platform_req: Vec<String>,
+
     #[arg(long, default_value_t = true)]
     pub prefer_dist: bool,
 
-    /// Prefer VCS source installs over dist archives
     #[arg(long)]
     pub prefer_source: bool,
 
-    /// Also update dependencies of listed packages, except root requirements
     #[arg(short = 'w', long = "with-dependencies")]
     pub with_dependencies: bool,
 
-    /// Also update dependencies of listed packages, including root requirements
     #[arg(short = 'W', long = "with-all-dependencies")]
     pub with_all_dependencies: bool,
+
+    #[arg(long)]
+    pub no_autoloader: bool,
+
+    #[arg(long)]
+    pub no_scripts: bool,
+
+    /// Only refresh lock content-hash / metadata without resolving versions
+    #[arg(long)]
+    pub lock: bool,
+
+    #[arg(long)]
+    pub audit: bool,
 }
 
 pub async fn run(args: UpdateArgs) -> Result<()> {
@@ -67,6 +81,25 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     if !json_path.exists() {
         bail!("composer.json not found");
     }
+
+    let manifest = ComposerJson::load(&json_path)?;
+    let vendor = vendor_dir(&manifest, &cwd);
+    let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
+    let with_dev = !args.no_dev;
+
+    if args.lock {
+        if !lock_path.exists() {
+            bail!("composer.lock not found");
+        }
+        let mut lock = composer_lock::ComposerLock::load(&lock_path)?;
+        lock.content_hash = composer_lock::content_hash_from_relevant(
+            &composer_manifest::relevant_content(&manifest),
+        );
+        lock.save(&lock_path)?;
+        success("Updated content-hash in composer.lock (--lock)");
+        return Ok(());
+    }
+
     let update_deps = if args.with_all_dependencies {
         UpdateDeps::WithAllDependencies
     } else if args.with_dependencies {
@@ -87,16 +120,17 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
                 args.packages.len()
             ));
         } else {
-            info(
-                "No composer.lock — cannot pin other packages; resolving full dependency tree",
-            );
+            info("No composer.lock — cannot pin other packages; resolving full dependency tree");
         }
     }
 
-    let manifest = ComposerJson::load(&json_path)?;
-    let vendor = vendor_dir(&manifest, &cwd);
-    let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
-    let with_dev = !args.no_dev;
+    run_lifecycle(
+        &manifest,
+        ScriptEvent::PreUpdateCmd,
+        &cwd,
+        args.no_scripts,
+        with_dev,
+    )?;
 
     let existing_lock = if lock_path.exists() && !args.packages.is_empty() {
         Some(composer_lock::ComposerLock::load(&lock_path)?)
@@ -111,18 +145,14 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         minimum_stability: manifest.minimum_stability().to_string(),
         concurrency,
         ignore_platform_reqs: args.ignore_platform_reqs,
+        ignore_platform_req: args.ignore_platform_req.clone(),
         packages_to_update: args.packages.clone(),
         update_deps,
     };
 
-    let resolution = resolve(
-        &manifest,
-        &options,
-        &cwd,
-        existing_lock.as_ref(),
-    )
-    .await
-    .context("resolve (PubGrub)")?;
+    let resolution = resolve(&manifest, &options, &cwd, existing_lock.as_ref())
+        .await
+        .context("resolve (PubGrub)")?;
     let lock = resolution.to_lock(&manifest);
     let installer_paths = manifest.installer_paths();
 
@@ -146,12 +176,14 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     if !args.ignore_platform_reqs {
         let mut platform = Platform::detect().context("detect PHP platform")?;
         platform.apply_config_platform(manifest.config.as_ref());
-        check_requirements(&platform, &manifest.require).context("platform check")?;
+        let ign = &args.ignore_platform_req;
+        check_requirements_filtered(&platform, &manifest.require, ign).context("platform check")?;
         if with_dev {
-            check_requirements(&platform, &manifest.require_dev).context("platform check (dev)")?;
+            check_requirements_filtered(&platform, &manifest.require_dev, ign)
+                .context("platform check (dev)")?;
         }
         for pkg in lock.packages_to_install(with_dev) {
-            check_requirements(&platform, &pkg.require)
+            check_requirements_filtered(&platform, &pkg.require, ign)
                 .with_context(|| format!("platform check for {}", pkg.name))?;
         }
         if platform.reliable {
@@ -162,15 +194,19 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         }
     }
 
+    warn_unapproved_plugins(&lock, &manifest, with_dev);
+
     lock.save(&lock_path)?;
     success(&format!("Wrote {}", lock_path.display()));
 
     std::fs::create_dir_all(&vendor)?;
-    let prefer_dist = args.prefer_dist && !args.prefer_source;
+    let prefer_dist = manifest.resolve_prefer_dist(args.prefer_dist, args.prefer_source);
+    let auth = AuthStore::load(Some(&cwd)).unwrap_or_default();
     let installer = PackageInstaller::new(concurrency, args.verify_checksums)?
         .with_project_root(&cwd)
-        .with_installer_paths(installer_paths)
-        .with_prefer_dist(prefer_dist);
+        .with_installer_paths(installer_paths.clone())
+        .with_prefer_dist(prefer_dist)
+        .with_auth(auth);
     let packages = composer_resolver::locked_list(&lock, with_dev);
     let refs: Vec<_> = packages.iter().collect();
     installer.install_all(&refs, &vendor).await?;
@@ -178,28 +214,62 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     let stats = installer.stats().snapshot();
     info(&format!(
         "cache hits: {}  downloads: {}  skipped: {}  hardlinks: {}  copies: {}",
-        stats.cache_hits,
-        stats.downloaded,
-        stats.skipped,
-        stats.hardlinks,
-        stats.copies,
+        stats.cache_hits, stats.downloaded, stats.skipped, stats.hardlinks, stats.copies,
     ));
 
-    generate(
-        &cwd,
-        &vendor,
-        &manifest,
-        Some(&lock),
-        &AutoloadOptions {
-            optimize: args.optimize_autoloader,
-            classmap_authoritative: args.classmap_authoritative,
+    link_bins(&refs, &vendor, &cwd, &manifest, &installer_paths)?;
+
+    if !args.no_autoloader {
+        run_lifecycle(
+            &manifest,
+            ScriptEvent::PreAutoloadDump,
+            &cwd,
+            args.no_scripts,
             with_dev,
-        },
+        )?;
+        generate(
+            &cwd,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions {
+                optimize: args.optimize_autoloader,
+                classmap_authoritative: args.classmap_authoritative,
+                with_dev,
+            },
+        )?;
+        run_lifecycle(
+            &manifest,
+            ScriptEvent::PostAutoloadDump,
+            &cwd,
+            args.no_scripts,
+            with_dev,
+        )?;
+    }
+
+    run_lifecycle(
+        &manifest,
+        ScriptEvent::PostUpdateCmd,
+        &cwd,
+        args.no_scripts,
+        with_dev,
     )?;
 
     success(&format!(
         "Update complete in {}",
         format_duration(start.elapsed())
     ));
+
+    // Composer-compatible: --audit fails the command when advisories are found.
+    if args.audit {
+        let audit_args = super::audit::AuditArgs {
+            format: "table".into(),
+            no_dev: args.no_dev,
+        };
+        super::audit::run(audit_args)
+            .await
+            .context("security audit failed")?;
+    }
+
     Ok(())
 }

@@ -1,8 +1,9 @@
 //! `composer-rs require`
 
 use super::{header, info, project_paths, success};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Args;
+use composer_auth::AuthStore;
 use composer_core::PackageId;
 use composer_manifest::ComposerJson;
 use composer_repo::RepositoryRegistry;
@@ -40,7 +41,8 @@ pub async fn run(args: RequireArgs) -> Result<()> {
         }
     };
 
-    let client = RepositoryRegistry::from_manifest(&manifest)?;
+    let auth = AuthStore::load(Some(&cwd)).unwrap_or_default();
+    let client = RepositoryRegistry::from_manifest_auth(&manifest, auth)?;
 
     for spec in &args.packages {
         let (name, constraint) = parse_package_spec(spec);
@@ -49,7 +51,12 @@ pub async fn run(args: RequireArgs) -> Result<()> {
         let constraint = if constraint == "*" {
             // Pick a sensible caret from latest stable
             match client
-                .find_best(&id, &composer_core::VersionConstraint::any(), true, "stable")
+                .find_best(
+                    &id,
+                    &composer_core::VersionConstraint::any(),
+                    true,
+                    "stable",
+                )
                 .await
             {
                 Ok(best) => {
@@ -98,10 +105,15 @@ pub async fn run(args: RequireArgs) -> Result<()> {
             concurrency: None,
             verify_checksums: false,
             ignore_platform_reqs: false,
+            ignore_platform_req: Vec::new(),
             prefer_dist: true,
             prefer_source: false,
             with_dependencies: false,
             with_all_dependencies: false,
+            no_autoloader: false,
+            no_scripts: false,
+            lock: false,
+            audit: false,
         };
         super::update::run(update_args).await?;
     }

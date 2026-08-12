@@ -1,11 +1,13 @@
 //! `composer-rs dump-autoload`
 
 use super::{header, project_paths, success, vendor_dir};
-use anyhow::{bail, Result};
+use crate::hooks::run_lifecycle;
+use anyhow::{Result, bail};
 use clap::Args;
-use composer_autoload::{generate, AutoloadOptions};
+use composer_autoload::{AutoloadOptions, generate};
 use composer_lock::ComposerLock;
 use composer_manifest::ComposerJson;
+use composer_scripts::ScriptEvent;
 
 #[derive(Args, Debug, Clone)]
 pub struct DumpAutoloadArgs {
@@ -17,6 +19,9 @@ pub struct DumpAutoloadArgs {
 
     #[arg(long)]
     pub no_dev: bool,
+
+    #[arg(long)]
+    pub no_scripts: bool,
 }
 
 pub fn run(args: DumpAutoloadArgs) -> Result<()> {
@@ -27,12 +32,20 @@ pub fn run(args: DumpAutoloadArgs) -> Result<()> {
     }
     let manifest = ComposerJson::load(&json_path)?;
     let vendor = vendor_dir(&manifest, &cwd);
+    let with_dev = !args.no_dev;
     let lock = if lock_path.exists() {
         Some(ComposerLock::load(&lock_path)?)
     } else {
         None
     };
 
+    run_lifecycle(
+        &manifest,
+        ScriptEvent::PreAutoloadDump,
+        &cwd,
+        args.no_scripts,
+        with_dev,
+    )?;
     generate(
         &cwd,
         &vendor,
@@ -41,8 +54,15 @@ pub fn run(args: DumpAutoloadArgs) -> Result<()> {
         &AutoloadOptions {
             optimize: args.optimize,
             classmap_authoritative: args.classmap_authoritative,
-            with_dev: !args.no_dev,
+            with_dev,
         },
+    )?;
+    run_lifecycle(
+        &manifest,
+        ScriptEvent::PostAutoloadDump,
+        &cwd,
+        args.no_scripts,
+        with_dev,
     )?;
     success("Autoloader dumped");
     Ok(())

@@ -1,11 +1,7 @@
 //! composer-rs — high-performance Composer-compatible PHP package manager.
-//!
-//! Focus: parallel downloads + content-addressable cache (pnpm/uv style)
-//! so git worktrees share package bytes instead of duplicating vendor/.
-
-mod commands;
 
 use clap::{Parser, Subcommand};
+use composer_cli::commands;
 use console::style;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -20,11 +16,9 @@ a content-addressable package cache. Multiple worktrees hardlink into a shared C
 cutting disk use the way pnpm and uv do."
 )]
 struct Cli {
-    /// Enable verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Working directory (default: cwd)
     #[arg(long, global = true, value_name = "DIR")]
     working_dir: Option<std::path::PathBuf>,
 
@@ -34,35 +28,38 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Install dependencies from composer.lock (or resolve from composer.json)
     Install(commands::install::InstallArgs),
-
-    /// Resolve and update dependencies, rewrite composer.lock, install
     Update(commands::update::UpdateArgs),
-
-    /// Add a package to require / require-dev
     Require(commands::require::RequireArgs),
-
-    /// Remove a package from require / require-dev
     Remove(commands::remove::RemoveArgs),
-
-    /// Create a basic composer.json
     Init(commands::init_cmd::InitArgs),
-
-    /// Validate composer.json / composer.lock
     Validate(commands::validate::ValidateArgs),
-
-    /// Regenerate the autoloader
     #[command(name = "dump-autoload", alias = "dumpautoload")]
     DumpAutoload(commands::dump_autoload::DumpAutoloadArgs),
-
-    /// Search Packagist
     Search(commands::search::SearchArgs),
-
-    /// Show package details
     Show(commands::show::ShowArgs),
-
-    /// Cache management
+    Outdated(commands::outdated::OutdatedArgs),
+    #[command(name = "run-script", alias = "run")]
+    RunScript(commands::run_script::RunScriptArgs),
+    #[command(name = "check-platform-reqs")]
+    CheckPlatform(commands::check_platform::CheckPlatformArgs),
+    Reinstall(commands::reinstall::ReinstallArgs),
+    Depends(commands::depends::DependsArgs),
+    Why(commands::depends::DependsArgs),
+    #[command(name = "why-not")]
+    WhyNot(commands::depends::DependsArgs),
+    Prohibits(commands::depends::DependsArgs),
+    Config(commands::config_cmd::ConfigArgs),
+    Diagnose(commands::diagnose::DiagnoseArgs),
+    Licenses(commands::licenses::LicensesArgs),
+    Status(commands::status::StatusArgs),
+    Audit(commands::audit::AuditArgs),
+    #[command(name = "create-project")]
+    CreateProject(commands::create_project::CreateProjectArgs),
+    Bump(commands::bump::BumpArgs),
+    Fund(commands::fund::FundArgs),
+    Exec(commands::exec_cmd::ExecArgs),
+    Global(commands::global_cmd::GlobalArgs),
     #[command(subcommand)]
     Cache(commands::cache::CacheCommands),
 }
@@ -84,7 +81,11 @@ async fn main() -> ExitCode {
 
     if let Some(dir) = &cli.working_dir {
         if let Err(e) = std::env::set_current_dir(dir) {
-            eprintln!("{} failed to chdir {}: {e}", style("error:").red().bold(), dir.display());
+            eprintln!(
+                "{} failed to chdir {}: {e}",
+                style("error:").red().bold(),
+                dir.display()
+            );
             return ExitCode::FAILURE;
         }
     }
@@ -99,6 +100,25 @@ async fn main() -> ExitCode {
         Commands::DumpAutoload(args) => commands::dump_autoload::run(args),
         Commands::Search(args) => commands::search::run(args).await,
         Commands::Show(args) => commands::show::run(args).await,
+        Commands::Outdated(args) => commands::outdated::run(args).await,
+        Commands::RunScript(args) => commands::run_script::run(args),
+        Commands::CheckPlatform(args) => commands::check_platform::run(args),
+        Commands::Reinstall(args) => commands::reinstall::run(args).await,
+        Commands::Depends(args) => commands::depends::run_depends(args).await,
+        Commands::Why(args) => commands::depends::run_why(args).await,
+        Commands::WhyNot(args) | Commands::Prohibits(args) => {
+            commands::depends::run_prohibits(args).await
+        }
+        Commands::Config(args) => commands::config_cmd::run(args),
+        Commands::Diagnose(args) => commands::diagnose::run(args).await,
+        Commands::Licenses(args) => commands::licenses::run(args),
+        Commands::Status(args) => commands::status::run(args),
+        Commands::Audit(args) => commands::audit::run(args).await,
+        Commands::CreateProject(args) => commands::create_project::run(args).await,
+        Commands::Bump(args) => commands::bump::run(args),
+        Commands::Fund(args) => commands::fund::run(args),
+        Commands::Exec(args) => commands::exec_cmd::run(args),
+        Commands::Global(args) => commands::global_cmd::run(args),
         Commands::Cache(cmd) => commands::cache::run(cmd),
     };
 

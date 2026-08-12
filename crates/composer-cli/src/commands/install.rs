@@ -1,53 +1,59 @@
 //! `composer-rs install`
 
 use super::{format_duration, header, info, project_paths, success, vendor_dir, warning};
-use anyhow::{bail, Context, Result};
+use crate::hooks::{link_bins, run_lifecycle, warn_unapproved_plugins};
+use anyhow::{Context, Result, bail};
 use clap::Args;
-use composer_autoload::{generate, AutoloadOptions};
-use composer_download::{default_concurrency, PackageInstaller};
+use composer_auth::AuthStore;
+use composer_autoload::{AutoloadOptions, generate};
+use composer_core::{Platform, check_requirements_filtered};
+use composer_download::{PackageInstaller, default_concurrency};
 use composer_lock::ComposerLock;
 use composer_manifest::ComposerJson;
-use composer_core::{check_requirements, Platform};
-use composer_resolver::{locked_list, resolve, ResolveOptions};
+use composer_resolver::{ResolveOptions, locked_list, resolve};
+use composer_scripts::ScriptEvent;
 use std::time::Instant;
 
 #[derive(Args, Debug, Clone)]
 pub struct InstallArgs {
-    /// Skip require-dev packages
     #[arg(long)]
     pub no_dev: bool,
 
-    /// Do not install; only show what would happen
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Prefer dist archives (default)
     #[arg(long, default_value_t = true)]
     pub prefer_dist: bool,
 
-    /// Prefer VCS source installs over dist archives
     #[arg(long)]
     pub prefer_source: bool,
 
-    /// Optimize PSR autoload into classmap
     #[arg(short = 'o', long)]
     pub optimize_autoloader: bool,
 
-    /// Authoritative classmap
     #[arg(short = 'a', long)]
     pub classmap_authoritative: bool,
 
-    /// Max concurrent downloads (default: adaptive)
     #[arg(long)]
     pub concurrency: Option<usize>,
 
-    /// Verify dist shasum when present
     #[arg(long)]
     pub verify_checksums: bool,
 
-    /// Ignore platform requirements (php, ext-*)
     #[arg(long)]
     pub ignore_platform_reqs: bool,
+
+    #[arg(long = "ignore-platform-req", value_name = "REQ")]
+    pub ignore_platform_req: Vec<String>,
+
+    #[arg(long)]
+    pub no_autoloader: bool,
+
+    #[arg(long)]
+    pub no_scripts: bool,
+
+    #[arg(long)]
+    pub audit: bool,
 }
 
 pub async fn run(args: InstallArgs) -> Result<()> {
@@ -63,6 +69,14 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     let vendor = vendor_dir(&manifest, &cwd);
     let with_dev = !args.no_dev;
     let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
+
+    run_lifecycle(
+        &manifest,
+        ScriptEvent::PreInstallCmd,
+        &cwd,
+        args.no_scripts,
+        with_dev,
+    )?;
 
     let lock = if lock_path.exists() {
         info(&format!("Lock file: {}", lock_path.display()));
@@ -86,6 +100,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
             minimum_stability: manifest.minimum_stability().to_string(),
             concurrency,
             ignore_platform_reqs: args.ignore_platform_reqs,
+            ignore_platform_req: args.ignore_platform_req.clone(),
             packages_to_update: Vec::new(),
             update_deps: Default::default(),
         };
@@ -102,7 +117,12 @@ pub async fn run(args: InstallArgs) -> Result<()> {
 
     let packages = locked_list(&lock, with_dev);
     let installer_paths = manifest.installer_paths();
-    if !installer_paths.is_empty() {
+    if manifest
+        .extra
+        .as_ref()
+        .and_then(|e| e.get("installer-paths"))
+        .is_some()
+    {
         info("Using custom installer-paths from composer.json extra");
     }
     info(&format!(
@@ -124,12 +144,14 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     if !args.ignore_platform_reqs {
         let mut platform = Platform::detect().context("detect PHP platform")?;
         platform.apply_config_platform(manifest.config.as_ref());
-        check_requirements(&platform, &manifest.require).context("platform check")?;
+        let ign = &args.ignore_platform_req;
+        check_requirements_filtered(&platform, &manifest.require, ign).context("platform check")?;
         if with_dev {
-            check_requirements(&platform, &manifest.require_dev).context("platform check (dev)")?;
+            check_requirements_filtered(&platform, &manifest.require_dev, ign)
+                .context("platform check (dev)")?;
         }
         for pkg in &packages {
-            check_requirements(&platform, &pkg.require)
+            check_requirements_filtered(&platform, &pkg.require, ign)
                 .with_context(|| format!("platform check for {}", pkg.name))?;
         }
         if platform.reliable {
@@ -140,13 +162,16 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         }
     }
 
-    std::fs::create_dir_all(&vendor)?;
+    warn_unapproved_plugins(&lock, &manifest, with_dev);
 
-    let prefer_dist = args.prefer_dist && !args.prefer_source;
+    std::fs::create_dir_all(&vendor)?;
+    let prefer_dist = manifest.resolve_prefer_dist(args.prefer_dist, args.prefer_source);
+    let auth = AuthStore::load(Some(&cwd)).unwrap_or_default();
     let installer = PackageInstaller::new(concurrency, args.verify_checksums)?
         .with_project_root(&cwd)
-        .with_installer_paths(installer_paths)
-        .with_prefer_dist(prefer_dist);
+        .with_installer_paths(installer_paths.clone())
+        .with_prefer_dist(prefer_dist)
+        .with_auth(auth);
     let refs: Vec<&composer_lock::LockedPackage> = packages.iter().collect();
     installer
         .install_all(&refs, &vendor)
@@ -164,21 +189,45 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         composer_cache::format_bytes(stats.bytes),
     ));
 
-    // Autoloader
-    generate(
-        &cwd,
-        &vendor,
-        &manifest,
-        Some(&lock),
-        &AutoloadOptions {
-            optimize: args.optimize_autoloader,
-            classmap_authoritative: args.classmap_authoritative,
-            with_dev,
-        },
-    )?;
-    success("Autoloader generated");
+    link_bins(&refs, &vendor, &cwd, &manifest, &installer_paths)?;
 
-    // Marker for tooling
+    if !args.no_autoloader {
+        run_lifecycle(
+            &manifest,
+            ScriptEvent::PreAutoloadDump,
+            &cwd,
+            args.no_scripts,
+            with_dev,
+        )?;
+        generate(
+            &cwd,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions {
+                optimize: args.optimize_autoloader,
+                classmap_authoritative: args.classmap_authoritative,
+                with_dev,
+            },
+        )?;
+        success("Autoloader generated");
+        run_lifecycle(
+            &manifest,
+            ScriptEvent::PostAutoloadDump,
+            &cwd,
+            args.no_scripts,
+            with_dev,
+        )?;
+    }
+
+    run_lifecycle(
+        &manifest,
+        ScriptEvent::PostInstallCmd,
+        &cwd,
+        args.no_scripts,
+        with_dev,
+    )?;
+
     let marker = vendor.join(".composer-rs-installed");
     std::fs::write(
         &marker,
@@ -193,5 +242,17 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         packages.len(),
         format_duration(start.elapsed())
     ));
+
+    // Composer-compatible: --audit fails the command when advisories are found.
+    if args.audit {
+        let audit_args = super::audit::AuditArgs {
+            format: "table".into(),
+            no_dev: args.no_dev,
+        };
+        super::audit::run(audit_args)
+            .await
+            .context("security audit failed")?;
+    }
+
     Ok(())
 }

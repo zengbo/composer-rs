@@ -6,9 +6,7 @@ pub mod installer_paths;
 pub mod repositories;
 
 pub use installer_paths::InstallerPaths;
-pub use repositories::{
-    parse_repositories, resolve_path_url, PathPackageManifest, Repository,
-};
+pub use repositories::{PathPackageManifest, Repository, parse_repositories, resolve_path_url};
 
 use composer_core::error::{Error, Result};
 use composer_core::{AutoloadConfig, PackageId, VersionConstraint};
@@ -152,6 +150,116 @@ impl ComposerJson {
             .to_string()
     }
 
+    /// Binary directory relative to project root (default `vendor/bin`).
+    pub fn bin_dir(&self) -> String {
+        self.config
+            .as_ref()
+            .and_then(|c| c.get("bin-dir"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}/bin", self.vendor_dir()))
+    }
+
+    /// Whether to generate/run `platform_check.php` (`config.platform-check`).
+    ///
+    /// Composer: `true` (default) / `false` / `"php-only"`.
+    pub fn platform_check_enabled(&self) -> bool {
+        match self.config.as_ref().and_then(|c| c.get("platform-check")) {
+            Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::String(s)) if s.eq_ignore_ascii_case("false") => false,
+            _ => true,
+        }
+    }
+
+    /// Preferred install method from config: `"dist"`, `"source"`, or `"auto"`.
+    pub fn preferred_install(&self) -> PreferInstall {
+        match self
+            .config
+            .as_ref()
+            .and_then(|c| {
+                c.get("preferred-install")
+                    .or_else(|| c.get("prefer-install"))
+            })
+            .and_then(|v| v.as_str())
+        {
+            Some("source") => PreferInstall::Source,
+            Some("dist") => PreferInstall::Dist,
+            _ => PreferInstall::Auto,
+        }
+    }
+
+    /// Resolve whether to prefer dist archives given CLI flags and config.
+    pub fn resolve_prefer_dist(&self, prefer_dist_flag: bool, prefer_source_flag: bool) -> bool {
+        if prefer_source_flag {
+            return false;
+        }
+        if !prefer_dist_flag {
+            // explicit --prefer-dist=false style (rare)
+            return matches!(self.preferred_install(), PreferInstall::Dist);
+        }
+        !matches!(self.preferred_install(), PreferInstall::Source)
+    }
+
+    /// `config.allow-plugins` map (package name or `*` → allowed).
+    pub fn allow_plugins(&self) -> BTreeMap<String, bool> {
+        let mut out = BTreeMap::new();
+        let Some(map) = self
+            .config
+            .as_ref()
+            .and_then(|c| c.get("allow-plugins"))
+            .and_then(|v| v.as_object())
+        else {
+            return out;
+        };
+        for (k, v) in map {
+            if let Some(b) = v.as_bool() {
+                out.insert(k.clone(), b);
+            }
+        }
+        out
+    }
+
+    /// Get a nested config string value by dotted key (e.g. `platform.php`).
+    pub fn config_get(&self, key: &str) -> Option<Value> {
+        let mut cur = self.config.as_ref()?;
+        for part in key.split('.') {
+            cur = cur.get(part)?;
+        }
+        Some(cur.clone())
+    }
+
+    /// Set a nested config value by dotted key, creating objects as needed.
+    pub fn config_set(&mut self, key: &str, value: Value) {
+        let parts: Vec<&str> = key.split('.').collect();
+        if parts.is_empty() {
+            return;
+        }
+        let mut root = self
+            .config
+            .take()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        if !root.is_object() {
+            root = Value::Object(serde_json::Map::new());
+        }
+        {
+            let mut map = root.as_object_mut().expect("object");
+            for (i, part) in parts.iter().enumerate() {
+                if i + 1 == parts.len() {
+                    map.insert((*part).to_string(), value.clone());
+                } else {
+                    let entry = map
+                        .entry((*part).to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if !entry.is_object() {
+                        *entry = Value::Object(serde_json::Map::new());
+                    }
+                    map = entry.as_object_mut().expect("object");
+                }
+            }
+        }
+        self.config = Some(root);
+    }
+
     pub fn prefer_stable(&self) -> bool {
         self.prefer_stable.unwrap_or(false)
     }
@@ -185,6 +293,15 @@ impl ComposerJson {
     pub fn installer_paths(&self) -> InstallerPaths {
         InstallerPaths::from_extra(self.extra.as_ref())
     }
+}
+
+/// `config.preferred-install` / `prefer-install`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreferInstall {
+    #[default]
+    Auto,
+    Dist,
+    Source,
 }
 
 fn parse_deps(map: &BTreeMap<String, String>) -> Result<Vec<(PackageId, VersionConstraint)>> {

@@ -1,7 +1,7 @@
 //! `composer-rs remove`
 
 use super::{header, project_paths, success};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Args;
 use composer_manifest::ComposerJson;
 
@@ -62,10 +62,15 @@ pub async fn run(args: RemoveArgs) -> Result<()> {
             concurrency: None,
             verify_checksums: false,
             ignore_platform_reqs: false,
+            ignore_platform_req: Vec::new(),
             prefer_dist: true,
             prefer_source: false,
             with_dependencies: false,
             with_all_dependencies: false,
+            no_autoloader: false,
+            no_scripts: false,
+            lock: false,
+            audit: false,
         };
         super::update::run(update_args).await?;
     }

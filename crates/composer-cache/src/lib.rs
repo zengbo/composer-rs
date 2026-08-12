@@ -8,7 +8,7 @@
 #![deny(unsafe_code)]
 
 use composer_core::error::{Error, Result};
-use composer_core::hash::{content_hash, ContentHash};
+use composer_core::hash::{ContentHash, content_hash};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::fs;
@@ -395,11 +395,9 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             let ino1 = fs::metadata(vendor.join("hello.txt")).unwrap().ino();
             let ino2 = fs::metadata(vendor2.join("hello.txt")).unwrap().ino();
-            let cas_ino = fs::metadata(
-                cas.get("key-1").unwrap().join("hello.txt"),
-            )
-            .unwrap()
-            .ino();
+            let cas_ino = fs::metadata(cas.get("key-1").unwrap().join("hello.txt"))
+                .unwrap()
+                .ino();
             assert_eq!(ino1, cas_ino);
             assert_eq!(ino2, cas_ino);
         }

@@ -2,13 +2,16 @@
 
 use crate::index::PackageIndex;
 use composer_core::error::{Error, Result};
-use composer_core::{constraint_to_ranges, check_requirements, ComposerVersion, PackageId, Platform, Stability, VersionConstraint};
+use composer_core::{
+    ComposerVersion, PackageId, Platform, Stability, VersionConstraint,
+    check_requirements_filtered, conflict_to_ranges, constraint_to_ranges,
+};
 use composer_lock::LockedPackage;
 use pubgrub::{
-    resolve, Dependencies, DependencyConstraints, DependencyProvider, OfflineDependencyProvider,
-    PackageResolutionStatistics, Ranges,
+    Dependencies, DependencyConstraints, DependencyProvider, OfflineDependencyProvider,
+    PackageResolutionStatistics, Ranges, resolve,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use tracing::debug;
 
@@ -24,6 +27,7 @@ pub struct SolveRequest {
     pub root_provide: Vec<String>,
     pub platform: Platform,
     pub ignore_platform_reqs: bool,
+    pub ignore_platform_req: Vec<String>,
 }
 
 /// Run PubGrub and return selected locked packages by name.
@@ -43,9 +47,8 @@ pub fn solve_with_pubgrub(
     let provider = ComposerOfflineProvider::build(index, request)?;
     let root_version = ComposerVersion::parse("1.0.0").unwrap();
 
-    let solution = resolve(&provider, ROOT.to_string(), root_version).map_err(|e| {
-        Error::Resolve(format!("PubGrub could not find a set of packages: {e}"))
-    })?;
+    let solution = resolve(&provider, ROOT.to_string(), root_version)
+        .map_err(|e| Error::Resolve(format!("PubGrub could not find a set of packages: {e}")))?;
 
     let mut out = HashMap::new();
     for (name, version) in solution {
@@ -120,17 +123,43 @@ pub fn normalize_solution(
 fn version_matches_platform(
     locked: &LockedPackage,
     platform: &Platform,
-    ignore: bool,
+    ignore_all: bool,
+    ignore_patterns: &[String],
 ) -> bool {
     // No PHP / no overrides: do not silently drop candidates; install-time
     // checks will error with a clear remediation message.
-    if ignore || !platform.reliable {
+    if ignore_all || !platform.reliable {
         return true;
     }
-    check_requirements(platform, &locked.require).is_ok()
+    check_requirements_filtered(platform, &locked.require, ignore_patterns).is_ok()
+}
+
+/// Names reachable from root via `require` edges (any version's requires).
+fn reachable_package_names(
+    index: &PackageIndex,
+    roots: &[(PackageId, VersionConstraint)],
+) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut q: VecDeque<String> = roots.iter().map(|(id, _)| id.to_string()).collect();
+    while let Some(name) = q.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(versions) = index.versions_of(&name) {
+            for v in versions {
+                for dep in v.require.keys() {
+                    if PackageId::parse(dep).is_ok_and(|p| !p.is_platform()) {
+                        q.push_back(dep.clone());
+                    }
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Reject solutions where an installed package violates another's `conflict` map.
+/// Kept as a safety net after encoding conflicts in the PubGrub graph.
 fn validate_conflicts(selected: &HashMap<String, LockedPackage>) -> Result<()> {
     for (name, pkg) in selected {
         for (other_name, constraint_str) in &pkg.conflict {
@@ -154,7 +183,13 @@ fn validate_conflicts(selected: &HashMap<String, LockedPackage>) -> Result<()> {
 /// Custom provider so we can prefer-stable / prefer-lowest and skip platform pkgs.
 struct ComposerOfflineProvider {
     /// package → (version → deps)
-    graph: HashMap<String, Vec<(ComposerVersion, DependencyConstraints<String, Ranges<ComposerVersion>>)>>,
+    graph: HashMap<
+        String,
+        Vec<(
+            ComposerVersion,
+            DependencyConstraints<String, Ranges<ComposerVersion>>,
+        )>,
+    >,
     prefer_lowest: bool,
     prefer_stable: bool,
 }
@@ -163,7 +198,10 @@ impl ComposerOfflineProvider {
     fn build(index: &PackageIndex, request: &SolveRequest) -> Result<Self> {
         let mut graph: HashMap<
             String,
-            Vec<(ComposerVersion, DependencyConstraints<String, Ranges<ComposerVersion>>)>,
+            Vec<(
+                ComposerVersion,
+                DependencyConstraints<String, Ranges<ComposerVersion>>,
+            )>,
         > = HashMap::new();
 
         // Root package
@@ -185,6 +223,11 @@ impl ComposerOfflineProvider {
         let root_ver = ComposerVersion::parse("1.0.0").unwrap();
         graph.insert(ROOT.into(), vec![(root_ver, root_deps)]);
 
+        // Only encode `conflict` against packages that can actually appear in the
+        // solution. Adding complement-deps for unused names would force PubGrub
+        // to install them just to satisfy the conflict edge.
+        let reachable = reachable_package_names(index, &request.root_deps);
+
         for name in index.package_names() {
             let mut versions = Vec::new();
             for iv in index.all_versions(name) {
@@ -192,6 +235,7 @@ impl ComposerOfflineProvider {
                     &iv.locked,
                     &request.platform,
                     request.ignore_platform_reqs,
+                    &request.ignore_platform_req,
                 ) {
                     continue;
                 }
@@ -215,14 +259,21 @@ impl ComposerOfflineProvider {
                     if dep_id.is_platform() {
                         continue;
                     }
-                    // conflict packages: empty range dependency
-                    deps.insert(dep_name.clone(), constraint_to_ranges(&VersionConstraint::new(dep_c)));
+                    deps.insert(
+                        dep_name.clone(),
+                        constraint_to_ranges(&VersionConstraint::new(dep_c)),
+                    );
                 }
-                // Note: `conflict` is not fully encoded here. Encoding it as a
-                // dependency on the complement pulls the conflict package into the
-                // graph even when unused. We enforce conflicts post-solve instead
-                // when needed; require/replace/provide cover the common path.
-                let _ = &iv.locked.conflict;
+                for (other, constraint_str) in &iv.locked.conflict {
+                    if PackageId::parse(other).is_ok_and(|p| p.is_platform()) {
+                        continue;
+                    }
+                    if !reachable.contains(other) {
+                        continue;
+                    }
+                    let allowed = conflict_to_ranges(&VersionConstraint::new(constraint_str));
+                    deps.insert(other.clone(), allowed);
+                }
 
                 versions.push((iv.version.clone(), deps));
             }
@@ -401,6 +452,7 @@ mod tests {
             root_provide: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
+            ignore_platform_req: vec![],
         };
 
         let sol = solve_with_pubgrub(&index, &request).unwrap();
@@ -435,6 +487,7 @@ mod tests {
             root_provide: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
+            ignore_platform_req: vec![],
         };
 
         let err = solve_with_pubgrub(&index, &request).unwrap_err();
@@ -449,8 +502,7 @@ mod tests {
     fn package_conflict_rejected() {
         let mut index = PackageIndex::new();
         let mut a = pkg("vendor/a", "1.0.0", &[]);
-        a.conflict
-            .insert("vendor/b".into(), "^1.0".into());
+        a.conflict.insert("vendor/b".into(), "^1.0".into());
         index.insert_locked(a);
         index.insert_locked(pkg("vendor/b", "1.0.0", &[]));
 
@@ -472,12 +524,52 @@ mod tests {
             root_provide: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
+            ignore_platform_req: vec![],
         };
 
         let err = solve_with_pubgrub(&index, &request).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("conflicts with"),
-            "unexpected error: {err}"
+            msg.contains("conflicts with") || msg.contains("PubGrub") || msg.contains("could not"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn solver_picks_non_conflicting_version() {
+        let mut index = PackageIndex::new();
+        let mut a = pkg("vendor/a", "1.0.0", &[]);
+        a.conflict.insert("vendor/b".into(), "^1.0".into());
+        index.insert_locked(a);
+        index.insert_locked(pkg("vendor/b", "1.0.0", &[]));
+        index.insert_locked(pkg("vendor/b", "2.0.0", &[]));
+
+        let request = SolveRequest {
+            root_deps: vec![
+                (
+                    PackageId::parse("vendor/a").unwrap(),
+                    VersionConstraint::new("*"),
+                ),
+                (
+                    PackageId::parse("vendor/b").unwrap(),
+                    VersionConstraint::new("*"),
+                ),
+            ],
+            prefer_stable: true,
+            prefer_lowest: false,
+            minimum_stability: Stability::Stable,
+            root_replace: vec![],
+            root_provide: vec![],
+            platform: Platform::with_php("8.2.0").unwrap(),
+            ignore_platform_reqs: false,
+            ignore_platform_req: vec![],
+        };
+
+        let sol = solve_with_pubgrub(&index, &request).unwrap();
+        assert_eq!(sol["vendor/a"].version, "1.0.0");
+        assert_eq!(
+            sol["vendor/b"].version, "2.0.0",
+            "solver should skip B 1.x due to A's conflict"
         );
     }
 }

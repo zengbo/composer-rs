@@ -5,10 +5,12 @@ members = [
     "crates/composer-cache",
     "crates/composer-lock",
     "crates/composer-manifest",
+    "crates/composer-auth",
     "crates/composer-repo",
     "crates/composer-resolver",
     "crates/composer-download",
     "crates/composer-autoload",
+    "crates/composer-scripts",
     "crates/composer-cli",
 ]
 
@@ -28,10 +30,12 @@ composer-core = { path = "crates/composer-core" }
 composer-cache = { path = "crates/composer-cache" }
 composer-lock = { path = "crates/composer-lock" }
 composer-manifest = { path = "crates/composer-manifest" }
+composer-auth = { path = "crates/composer-auth" }
 composer-repo = { path = "crates/composer-repo" }
 composer-resolver = { path = "crates/composer-resolver" }
 composer-download = { path = "crates/composer-download" }
 composer-autoload = { path = "crates/composer-autoload" }
+composer-scripts = { path = "crates/composer-scripts" }
 
 tokio = { version = "1.43", features = ["full"] }
 futures = "0.3"

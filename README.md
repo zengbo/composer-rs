@@ -60,6 +60,11 @@ composer-rs update
 composer-rs update vendor/package        # partial: only listed package
 composer-rs update vendor/package -w     # also its non-root dependencies
 composer-rs update vendor/package -W     # also all dependencies (incl. root reqs)
+composer-rs update --lock                # refresh content-hash only (no version changes)
+
+# Cache paths
+composer-rs cache dir
+composer-rs cache repo
 
 # Add / remove packages
 composer-rs require psr/log
@@ -72,6 +77,22 @@ composer-rs validate
 composer-rs search monolog
 composer-rs show psr/log
 
+# Day-to-day extras
+composer-rs outdated
+composer-rs why monolog/monolog
+composer-rs depends psr/log
+composer-rs check-platform-reqs
+composer-rs reinstall vendor/package
+composer-rs run-script test
+composer-rs audit
+composer-rs licenses
+composer-rs diagnose
+composer-rs show -t
+composer-rs bump
+composer-rs fund
+composer-rs exec phpunit -- --version
+composer-rs global require phpunit/phpunit
+
 # Cache
 composer-rs cache info
 composer-rs cache clear
@@ -83,13 +104,19 @@ composer-rs cache clear
 |------|-------------|
 | `--concurrency N` | Cap parallel downloads (default: `cores×8`, clamped 16–128) |
 | `--no-dev` | Skip `require-dev` |
-| `--ignore-platform-reqs` | Skip `php` / `ext-*` checks |
+| `--ignore-platform-reqs` | Skip all `php` / `ext-*` checks |
+| `--ignore-platform-req=ext-*` | Skip matching platform reqs (repeatable) |
 | `--prefer-source` | Prefer VCS clone over dist zip |
 | `-w` / `--with-dependencies` | Partial update: also free non-root deps of listed packages |
 | `-W` / `--with-all-dependencies` | Partial update: also free all deps (including root reqs) |
+| `--no-scripts` | Skip lifecycle / named scripts |
+| `--no-autoloader` | Skip autoload generation |
 | `--verify-checksums` | Fail on dist shasum mismatch |
 | `--dry-run` | Resolve / plan only |
 | `-o` / `--optimize-autoloader` | Classmap optimization |
+
+See **[docs/COMPOSER_PARITY.md](docs/COMPOSER_PARITY.md)** for full Composer parity status.  
+See **[docs/BENCHMARK.md](docs/BENCHMARK.md)** for how to compare cold/warm install vs Composer.
 
 ## Architecture
 
@@ -99,11 +126,13 @@ crates/
 ├── composer-core        # PackageId, versions, constraints, errors
 ├── composer-manifest    # composer.json
 ├── composer-lock        # composer.lock
+├── composer-auth        # auth.json / COMPOSER_AUTH
 ├── composer-cache       # CAS + hardlink install
 ├── composer-repo        # Packagist Composer API v2 client
-├── composer-resolver    # Parallel metadata fetch + greedy solver
-├── composer-download    # HTTP/2 parallel download + zip/tar extract
-└── composer-autoload    # vendor/autoload.php generation
+├── composer-resolver    # Parallel metadata fetch + PubGrub solver
+├── composer-download    # HTTP/2 parallel download + zip/tar extract + bins
+├── composer-autoload    # vendor/autoload.php generation
+└── composer-scripts     # scripts + lifecycle hooks
 ```
 
 ## Advanced features
@@ -144,8 +173,10 @@ Path packages are **symlinked** into `vendor/` by default. VCS packages are clon
 - Installs dist archives from Packagist (zip / tar.gz / …)
 - Path + VCS repositories, `extra.installer-paths`, PubGrub resolution
 - Platform requirements (`php`, `ext-*`) with `config.platform` overrides
+- `vendor/bin` links, shell scripts (`post-autoload-dump`, `run-script`), auth.json
 - Generates a usable PSR-4 / classmap autoloader with `platform_check.php`
-- **Not supported (yet):** Composer plugins as PHP, full scripts lifecycle hooks
+- **Not supported:** PHP Composer plugins / Flex recipes (see [docs/adr/0001-plugin-execution.md](docs/adr/0001-plugin-execution.md) and [docs/symfony-flex-spike.md](docs/symfony-flex-spike.md) for hybrid CI workflows)
+- `install --audit` / `update --audit` **fail the command** (exit 1) when advisories are found
 
 For plugin-heavy projects keep using official Composer; use composer-rs where install speed and worktree disk matter most (CI, monorepos, many branches).
 

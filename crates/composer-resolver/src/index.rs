@@ -95,9 +95,8 @@ impl PackageIndex {
     }
 
     fn insert_locked_with_provider(&mut self, locked: LockedPackage, provided_by: Option<String>) {
-        let version = ComposerVersion::parse(&locked.version).unwrap_or_else(|_| {
-            ComposerVersion::parse("0.0.0").expect("0.0.0 parses")
-        });
+        let version = ComposerVersion::parse(&locked.version)
+            .unwrap_or_else(|_| ComposerVersion::parse("0.0.0").expect("0.0.0 parses"));
         // For virtual aliases, disambiguate colliding version keys from different providers.
         let key = if let Some(ref real) = provided_by {
             format!("{}@{}", locked.version, real)
@@ -173,8 +172,10 @@ impl PackageIndex {
                 locked.provide.clear();
                 locked.replace.clear();
 
-                self.virtual_providers
-                    .insert((virtual_name.clone(), virtual_version.clone()), real_name.clone());
+                self.virtual_providers.insert(
+                    (virtual_name.clone(), virtual_version.clone()),
+                    real_name.clone(),
+                );
                 self.virtual_provider_names
                     .entry(virtual_name)
                     .or_default()

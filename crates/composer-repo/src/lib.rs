@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+use composer_auth::AuthStore;
 use composer_cache::metadata_dir;
 use composer_core::error::{Error, Result};
 use composer_core::{AutoloadConfig, ComposerVersion, PackageId, VersionConstraint};
@@ -26,6 +27,7 @@ pub struct RepositoryClient {
     /// In-memory package metadata cache.
     memory: Arc<DashMap<String, CachedPackage>>,
     metadata_ttl: Duration,
+    auth: AuthStore,
 }
 
 #[derive(Clone)]
@@ -109,6 +111,10 @@ impl RepositoryClient {
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self> {
+        Self::with_base_url_auth(base_url, AuthStore::default())
+    }
+
+    pub fn with_base_url_auth(base_url: impl Into<String>, auth: AuthStore) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .pool_max_idle_per_host(32)
@@ -126,7 +132,13 @@ impl RepositoryClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             memory: Arc::new(DashMap::new()),
             metadata_ttl: Duration::from_secs(600),
+            auth,
         })
+    }
+
+    pub fn with_auth(mut self, auth: AuthStore) -> Self {
+        self.auth = auth;
+        self
     }
 
     pub fn http(&self) -> &reqwest::Client {
@@ -134,7 +146,10 @@ impl RepositoryClient {
     }
 
     /// Fetch all versions of a package (Composer API v2).
-    pub async fn get_package_versions(&self, name: &PackageId) -> Result<Vec<RemotePackageVersion>> {
+    pub async fn get_package_versions(
+        &self,
+        name: &PackageId,
+    ) -> Result<Vec<RemotePackageVersion>> {
         let key = name.as_str().to_string();
 
         if let Some(cached) = self.memory.get(&key) {
@@ -158,9 +173,8 @@ impl RepositoryClient {
         let url = format!("{}/p2/{}.json", self.base_url, key);
         debug!(%url, "fetching package metadata");
 
-        let resp = self
-            .http
-            .get(&url)
+        let builder = self.auth.apply_to_request(&url, self.http.get(&url));
+        let resp = builder
             .send()
             .await
             .map_err(|e| Error::download(&url, e.to_string()))?;
@@ -170,10 +184,7 @@ impl RepositoryClient {
         }
 
         if !resp.status().is_success() {
-            return Err(Error::download(
-                &url,
-                format!("HTTP {}", resp.status()),
-            ));
+            return Err(Error::download(&url, format!("HTTP {}", resp.status())));
         }
 
         let body = resp
@@ -208,7 +219,9 @@ impl RepositoryClient {
 
         let mut candidates: Vec<&RemotePackageVersion> = versions
             .iter()
-            .filter(|v| v.version.stability() as u8 >= min as u8 || constraint.as_str().contains("dev"))
+            .filter(|v| {
+                v.version.stability() as u8 >= min as u8 || constraint.as_str().contains("dev")
+            })
             .filter(|v| constraint.matches(&v.version))
             .collect();
 
@@ -234,19 +247,31 @@ impl RepositoryClient {
         Ok(candidates[0].clone())
     }
 
-    /// Search packages via Packagist search API.
+    /// Search packages via the Packagist-compatible search API for this repository base URL.
+    ///
+    /// Applies configured auth (http-basic / bearer / tokens) so private Packagist /
+    /// Satis mirrors that protect `/search.json` work the same as metadata fetches.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let base = self.base_url.trim_end_matches('/');
+        // Public packagist uses packagist.org (not repo.packagist.org) for search.
+        let search_base = if base.contains("repo.packagist.org") || base.contains("packagist.org") {
+            "https://packagist.org"
+        } else {
+            base
+        };
         let url = format!(
-            "https://packagist.org/search.json?q={}&per_page={}",
+            "{search_base}/search.json?q={}&per_page={}",
             urlencoding_minimal(query),
             limit
         );
-        let resp = self
-            .http
-            .get(&url)
+        let builder = self.auth.apply_to_request(&url, self.http.get(&url));
+        let resp = builder
             .send()
             .await
             .map_err(|e| Error::download(&url, e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(Error::download(&url, format!("HTTP {}", resp.status())));
+        }
         let body: SearchResponse = resp
             .json()
             .await
@@ -308,8 +333,22 @@ pub struct RepositoryRegistry {
 }
 
 impl RepositoryRegistry {
-    /// Build from `composer.json` repositories (respects `packagist.org: false`).
+    /// Build from `composer.json` repositories using **global/env auth only**.
+    ///
+    /// Prefer [`from_manifest_auth`] with `AuthStore::load(Some(project_root))` so
+    /// project-local `auth.json` is applied (required for private Composer repos).
+    #[deprecated(
+        note = "use RepositoryRegistry::from_manifest_auth(manifest, AuthStore::load(Some(project_root)))"
+    )]
     pub fn from_manifest(manifest: &composer_manifest::ComposerJson) -> Result<Self> {
+        let auth = AuthStore::load(None).unwrap_or_default();
+        Self::from_manifest_auth(manifest, auth)
+    }
+
+    pub fn from_manifest_auth(
+        manifest: &composer_manifest::ComposerJson,
+        auth: AuthStore,
+    ) -> Result<Self> {
         let repos = manifest.repositories_list();
         let mut clients = Vec::new();
         let mut has_packagist = false;
@@ -320,16 +359,22 @@ impl RepositoryRegistry {
                 if normalized.contains("packagist.org") {
                     has_packagist = true;
                 }
-                clients.push(RepositoryClient::with_base_url(url)?);
+                clients.push(RepositoryClient::with_base_url_auth(url, auth.clone())?);
             }
         }
 
         if manifest.packagist_enabled() && !has_packagist {
-            clients.push(RepositoryClient::new()?);
+            clients.push(RepositoryClient::with_base_url_auth(
+                DEFAULT_PACKAGIST,
+                auth.clone(),
+            )?);
         }
 
         if clients.is_empty() {
-            clients.push(RepositoryClient::new()?);
+            clients.push(RepositoryClient::with_base_url_auth(
+                DEFAULT_PACKAGIST,
+                auth,
+            )?);
         }
 
         Ok(Self { clients })
@@ -354,13 +399,23 @@ impl RepositoryRegistry {
         Err(last_not_found.unwrap_or_else(|| Error::PackageNotFound(name.to_string())))
     }
 
-    /// Delegate search to the first repository client.
+    /// Search across configured repositories (first successful non-empty result wins;
+    /// falls back to the last error if all fail).
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        self.clients
-            .first()
-            .ok_or_else(|| Error::other("no repository configured"))?
-            .search(query, limit)
-            .await
+        let mut last_err = None;
+        for client in &self.clients {
+            match client.search(query, limit).await {
+                Ok(results) if !results.is_empty() => return Ok(results),
+                Ok(empty) => {
+                    // Keep empty success as fallback if nothing else returns hits.
+                    if last_err.is_none() {
+                        return Ok(empty);
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::other("no repository configured")))
     }
 
     /// Delegate show to the registry (tries all repos).
@@ -433,7 +488,9 @@ struct P2Response {
 }
 
 /// Packagist p2 may emit `"__unset"` for inherited fields that were cleared.
-fn deserialize_string_map<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, String>, D::Error>
+fn deserialize_string_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -468,7 +525,9 @@ where
     }
 }
 
-fn deserialize_optional_dist<'de, D>(deserializer: D) -> std::result::Result<Option<P2Dist>, D::Error>
+fn deserialize_optional_dist<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<P2Dist>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -550,6 +609,9 @@ struct P2Dist {
     reference: Option<String>,
     #[serde(default)]
     shasum: Option<String>,
+    /// Composer failover list: strings or `{ "url": "..." }` objects.
+    #[serde(default)]
+    mirrors: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -604,7 +666,7 @@ fn parse_p2_response(package: &str, body: &[u8]) -> Result<Vec<RemotePackageVers
                 url: d.url,
                 reference: d.reference,
                 shasum: d.shasum,
-                mirrors: None,
+                mirrors: d.mirrors,
             }),
             source: p.source.map(|s| SourceInfo {
                 source_type: s.source_type,
@@ -660,5 +722,38 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version.raw, "3.0.0");
         assert!(versions[0].dist.is_some());
+    }
+
+    #[test]
+    fn parse_p2_preserves_dist_mirrors_string_and_object() {
+        let sample = r#"{
+            "packages": {
+                "acme/lib": [
+                    {
+                        "version": "1.0.0",
+                        "dist": {
+                            "type": "zip",
+                            "url": "https://primary.example/acme.zip",
+                            "reference": "abc",
+                            "mirrors": [
+                                "https://mirror.example/acme.zip",
+                                { "url": "https://mirror2.example/acme.zip" }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let versions = parse_p2_response("acme/lib", sample.as_bytes()).unwrap();
+        let dist = versions[0].dist.as_ref().expect("dist");
+        let mirrors = dist.mirrors.as_ref().expect("mirrors");
+        assert_eq!(mirrors.len(), 2);
+        assert_eq!(mirrors[0].as_str(), Some("https://mirror.example/acme.zip"));
+        assert_eq!(
+            mirrors[1].get("url").and_then(|v| v.as_str()),
+            Some("https://mirror2.example/acme.zip")
+        );
+        let locked = versions[0].to_locked();
+        assert_eq!(locked.dist.as_ref().unwrap().mirrors, dist.mirrors);
     }
 }

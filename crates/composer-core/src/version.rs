@@ -111,6 +111,28 @@ impl ComposerVersion {
     pub fn numeric_parts(&self) -> (u64, u64, u64) {
         self.parts
     }
+
+    /// Composer-style 4-part `version_normalized` (e.g. `1.2.3` → `1.2.3.0`).
+    pub fn version_normalized_composer(&self) -> String {
+        if self.stability == Stability::Dev {
+            return self.normalized.clone();
+        }
+        let (maj, min, pat) = self.parts;
+        let mut s = format!("{maj}.{min}.{pat}.0");
+        if let Some(pre) = &self.pre {
+            // e.g. 1.0.0-beta1 → 1.0.0.0-beta1 (approximation)
+            s.push('-');
+            s.push_str(pre);
+        }
+        s
+    }
+}
+
+/// Normalize a raw version string the way Composer stores `version_normalized`.
+pub fn version_normalized(raw: &str) -> String {
+    ComposerVersion::parse(raw)
+        .map(|v| v.version_normalized_composer())
+        .unwrap_or_else(|_| raw.trim().trim_start_matches('v').to_string())
 }
 
 impl PartialOrd for ComposerVersion {
@@ -231,7 +253,10 @@ impl VersionConstraint {
 
         // AND: space or comma separated clauses
         let clauses: Vec<&str> = if s.contains(',') {
-            s.split(',').map(str::trim).filter(|c| !c.is_empty()).collect()
+            s.split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect()
         } else {
             // split on whitespace but keep operators attached
             split_and_clauses(s)
@@ -467,6 +492,14 @@ mod tests {
 
     fn v(s: &str) -> ComposerVersion {
         ComposerVersion::parse(s).unwrap()
+    }
+
+    #[test]
+    fn composer_version_normalized_four_parts() {
+        assert_eq!(version_normalized("1.2.3"), "1.2.3.0");
+        assert_eq!(version_normalized("v2.0.0"), "2.0.0.0");
+        assert_eq!(version_normalized("1.0"), "1.0.0.0");
+        assert!(version_normalized("dev-main").contains("dev-main"));
     }
 
     #[test]

@@ -32,10 +32,11 @@ impl InstallerPaths {
     pub fn from_extra(extra: Option<&Value>) -> Self {
         let mut rules = Vec::new();
         let Some(extra) = extra.and_then(|e| e.as_object()) else {
-            return Self { rules };
+            // Built-in composer/installers-style defaults when no custom paths.
+            return Self::composer_installers_defaults();
         };
         let Some(paths) = extra.get("installer-paths").and_then(|p| p.as_object()) else {
-            return Self { rules };
+            return Self::composer_installers_defaults();
         };
 
         for (template, matchers) in paths {
@@ -50,7 +51,55 @@ impl InstallerPaths {
                 rules.push((template.clone(), parsed));
             }
         }
+        // User rules win; append defaults for types not covered.
+        let mut combined = Self { rules };
+        combined.append_defaults();
+        combined
+    }
+
+    /// Common `composer/installers` type → path map (without the PHP plugin).
+    pub fn composer_installers_defaults() -> Self {
+        let pairs = [
+            ("wp-content/plugins/{$name}/", "type:wordpress-plugin"),
+            ("wp-content/themes/{$name}/", "type:wordpress-theme"),
+            ("wp-content/mu-plugins/{$name}/", "type:wordpress-muplugin"),
+            ("modules/{$name}/", "type:drupal-module"),
+            ("themes/{$name}/", "type:drupal-theme"),
+            ("profiles/{$name}/", "type:drupal-profile"),
+            ("web/modules/custom/{$name}/", "type:drupal-custom-module"),
+            ("libraries/{$name}/", "type:drupal-library"),
+            ("plugins/{$name}/", "type:craft-plugin"),
+            ("packages/{$name}/", "type:typo3-cms-extension"),
+        ];
+        let mut rules = Vec::new();
+        for (template, matcher) in pairs {
+            if let Some(m) = parse_matcher(matcher) {
+                rules.push((template.to_string(), vec![m]));
+            }
+        }
         Self { rules }
+    }
+
+    fn append_defaults(&mut self) {
+        let defaults = Self::composer_installers_defaults();
+        for (template, matchers) in defaults.rules {
+            // Skip if an existing rule already handles this type matcher.
+            let covered = matchers.iter().any(|m| {
+                self.rules.iter().any(|(_, existing)| {
+                    existing.iter().any(|e| {
+                        std::mem::discriminant(e) == std::mem::discriminant(m) && {
+                            match (e, m) {
+                                (PathMatcher::Type(a), PathMatcher::Type(b)) => a == b,
+                                _ => false,
+                            }
+                        }
+                    })
+                })
+            });
+            if !covered {
+                self.rules.push((template, matchers));
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -120,9 +169,7 @@ fn parse_matcher(s: &str) -> Option<PathMatcher> {
 }
 
 fn expand_template(template: &str, package_name: &str) -> String {
-    let (vendor, name) = package_name
-        .split_once('/')
-        .unwrap_or(("", package_name));
+    let (vendor, name) = package_name.split_once('/').unwrap_or(("", package_name));
     template
         .replace("{$name}", name)
         .replace("{$vendor}", vendor)
@@ -163,8 +210,10 @@ mod tests {
             paths.resolve(root, "wpackagist-plugin/foo", Some("library")),
             Some(PathBuf::from("/proj/vendor-plugins/foo"))
         );
-        assert!(paths
-            .resolve(root, "symfony/console", Some("library"))
-            .is_none());
+        assert!(
+            paths
+                .resolve(root, "symfony/console", Some("library"))
+                .is_none()
+        );
     }
 }
