@@ -41,6 +41,12 @@ Override cache location with `COMPOSER_RS_CACHE`.
 
 ## Install
 
+Prebuilt binaries are attached to [Releases](https://github.com/zengbo/composer-rs/releases) (`v*` tags):
+
+- `composer-rs-x86_64-unknown-linux-gnu`
+- `composer-rs-aarch64-unknown-linux-gnu`
+- `composer-rs-aarch64-apple-darwin`
+
 ```bash
 cargo install --path crates/composer-cli
 # binary: composer-rs

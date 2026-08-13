@@ -62,7 +62,8 @@ async fn e2e_path_install_bins_and_post_autoload_script() {
 
     let composer_json_path = app.join("composer.json");
     let composer_json_bytes = fs::read(&composer_json_path).unwrap();
-    let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes).unwrap()).unwrap();
+    let manifest =
+        ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes).unwrap()).unwrap();
     let options = ResolveOptions {
         with_dev: false,
         prefer_stable: true,

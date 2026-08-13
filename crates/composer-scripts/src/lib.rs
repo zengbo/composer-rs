@@ -512,10 +512,7 @@ mod tests {
         use composer_lock::{ComposerLock, DistInfo, LockedPackage};
         use std::collections::BTreeMap;
 
-        fn locked_pkg(
-            name: &str,
-            autoload: AutoloadConfig,
-        ) -> LockedPackage {
+        fn locked_pkg(name: &str, autoload: AutoloadConfig) -> LockedPackage {
             LockedPackage {
                 name: name.into(),
                 version: "1.0.0".into(),
@@ -585,9 +582,12 @@ class Handler {
                 locked_pkg(
                     "acme/handler",
                     AutoloadConfig {
-                        psr4: [("Acme\\".into(), composer_core::PathOrPaths::One("src/".into()))]
-                            .into_iter()
-                            .collect(),
+                        psr4: [(
+                            "Acme\\".into(),
+                            composer_core::PathOrPaths::One("src/".into()),
+                        )]
+                        .into_iter()
+                        .collect(),
                         ..Default::default()
                     },
                 ),

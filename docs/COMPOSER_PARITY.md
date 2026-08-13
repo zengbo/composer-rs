@@ -242,7 +242,7 @@ Closing remaining gaps after Phases 1–4. Items below are **done** unless marke
 - [x] **5.14** `audit` wiremock (`COMPOSER_RS_AUDIT_URL`)
 - [x] **5.15** `outdated` markers `!` / `~` / `=` and `--strict`
 - [x] **5.16** [BENCHMARK.md](BENCHMARK.md) (manual; no automated CI bench)
-- [x] **5.17** CI matrix: rust `{stable,1.85}` × `COMPOSER_PLATFORM_PHP` `{8.2,8.1}`
+- [x] **5.17** CI on `v*` tags (and manual `workflow_dispatch`): test on `ubuntu-24.04`; native release builds on `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-14`; tags publish GitHub Releases
 
 ---
 

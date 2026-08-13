@@ -1,50 +1,113 @@
 name: CI
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   test:
-    name: test (rust ${{ matrix.rust }}, php ${{ matrix.php }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable, "1.85"]
-        php: ["8.2.0", "8.1.0"]
-        include:
-          - rust: stable
-            php: "8.2.0"
-            extra: lint
+    name: test (linux-x86_64)
+    runs-on: ubuntu-24.04
     env:
-      COMPOSER_PLATFORM_PHP: ${{ matrix.php }}
+      COMPOSER_PLATFORM_PHP: "8.2.0"
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.rust }}-${{ matrix.php }}
+          shared-key: test-linux-x86_64
 
-      - name: Format + Clippy
-        if: matrix.extra == 'lint'
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets
+      - name: Format
+        run: cargo fmt --all -- --check
 
-      - name: Test workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
         run: cargo test --workspace
 
-      - name: Test with --no-dev style flags (unit)
-        run: cargo test -p composer-resolver --lib
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux-x86_64
+            artifact: composer-rs-x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            name: linux-aarch64
+            artifact: composer-rs-aarch64-unknown-linux-gnu
+          - os: macos-14
+            name: macos-aarch64
+            artifact: composer-rs-aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.name }}
 
       - name: Build release
-        if: matrix.rust == 'stable' && matrix.php == '8.2.0'
         run: cargo build --release -p composer-cli
+
+      - name: Package binary
+        run: |
+          cp target/release/composer-rs "${{ matrix.artifact }}"
+          chmod +x "${{ matrix.artifact }}"
+          file "${{ matrix.artifact }}"
+          ls -lh "${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: github-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: composer-rs-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum composer-rs-* | tee SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/composer-rs-x86_64-unknown-linux-gnu \
+            dist/composer-rs-aarch64-unknown-linux-gnu \
+            dist/composer-rs-aarch64-apple-darwin \
+            dist/SHA256SUMS

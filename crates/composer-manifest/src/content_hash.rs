@@ -178,10 +178,7 @@ mod tests {
     fn config_platform_participates() {
         let without = br#"{"name":"a/b"}"#;
         let with = br#"{"name":"a/b","config":{"platform":{"php":"8.2.0"}}}"#;
-        assert_ne!(
-            content_hash(without).unwrap(),
-            content_hash(with).unwrap()
-        );
+        assert_ne!(content_hash(without).unwrap(), content_hash(with).unwrap());
     }
 
     #[test]

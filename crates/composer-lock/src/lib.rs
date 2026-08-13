@@ -284,7 +284,9 @@ pub enum License {
 }
 
 /// Compute Composer-compatible content-hash from raw `composer.json` bytes.
-pub fn content_hash_from_composer_json(composer_json_bytes: &[u8]) -> composer_core::Result<String> {
+pub fn content_hash_from_composer_json(
+    composer_json_bytes: &[u8],
+) -> composer_core::Result<String> {
     composer_manifest::content_hash(composer_json_bytes)
 }
 
