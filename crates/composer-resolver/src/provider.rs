@@ -536,6 +536,48 @@ mod tests {
     }
 
     #[test]
+    fn virtual_provide_satisfies_implementation_requirement() {
+        let mut index = PackageIndex::new();
+        let mut guzzle = pkg("guzzlehttp/guzzle", "7.9.0", &[]);
+        guzzle
+            .provide
+            .insert("psr/http-client-implementation".into(), "1.0".into());
+        index.insert_locked(guzzle);
+        index.register_virtual_packages();
+
+        let request = SolveRequest {
+            root_deps: vec![
+                (
+                    PackageId::parse("guzzlehttp/guzzle").unwrap(),
+                    VersionConstraint::new("^7.0"),
+                ),
+                (
+                    PackageId::parse("psr/http-client-implementation").unwrap(),
+                    VersionConstraint::new("*"),
+                ),
+            ],
+            prefer_stable: true,
+            prefer_lowest: false,
+            minimum_stability: Stability::Stable,
+            root_replace: vec![],
+            root_provide: vec![],
+            platform: Platform::with_php("8.2.0").unwrap(),
+            ignore_platform_reqs: false,
+            ignore_platform_req: vec![],
+        };
+
+        let raw = solve_with_pubgrub(&index, &request).unwrap();
+        let sol = normalize_solution(raw, &index).unwrap();
+        assert!(sol.contains_key("guzzlehttp/guzzle"));
+        assert!(
+            !sol.contains_key("psr/http-client-implementation"),
+            "virtual name must collapse onto the provider: {:?}",
+            sol.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(sol["guzzlehttp/guzzle"].version, "7.9.0");
+    }
+
+    #[test]
     fn solver_picks_non_conflicting_version() {
         let mut index = PackageIndex::new();
         let mut a = pkg("vendor/a", "1.0.0", &[]);

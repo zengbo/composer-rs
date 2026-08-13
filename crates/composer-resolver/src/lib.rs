@@ -164,7 +164,7 @@ pub async fn resolve(
     // Load project-local auth.json so private Composer repos work during resolve/require.
     let auth = AuthStore::load(Some(project_root)).unwrap_or_default();
     let registry = RepositoryRegistry::from_manifest_auth(manifest, auth)?;
-    prefetch_remote(&registry, &mut index, &all_roots, options).await?;
+    let missing = prefetch_remote(&registry, &mut index, &all_roots, options).await?;
 
     if let Some(lock) = existing_lock {
         if !options.packages_to_update.is_empty() {
@@ -187,6 +187,13 @@ pub async fn resolve(
     }
 
     index.register_virtual_packages();
+    for name in &missing {
+        if !index.has_package(name) {
+            return Err(Error::PackageNotFound(format!(
+                "{name} (not on the repository and no installed package provides it)"
+            )));
+        }
+    }
 
     let mut platform = Platform::detect()?;
     platform.apply_config_platform(manifest.config.as_ref());
@@ -211,12 +218,19 @@ pub async fn resolve(
 
     let selected = normalize_solution(solve_with_pubgrub(&index, &request)?, &index)?;
 
-    // Split prod vs dev
+    // Split prod vs dev. Virtual root requirements (`provide`) map onto the
+    // real provider after normalize_solution, so seed those providers as prod.
     let mut prod_names: BTreeSet<String> = BTreeSet::new();
-    let mut queue: std::collections::VecDeque<String> = root_prod
-        .into_iter()
-        .map(|(id, _)| id.to_string())
-        .collect();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for (id, _) in &root_prod {
+        let name = id.to_string();
+        queue.push_back(name.clone());
+        for (sel_name, pkg) in &selected {
+            if pkg.provide.contains_key(&name) || pkg.replace.contains_key(&name) {
+                queue.push_back(sel_name.clone());
+            }
+        }
+    }
     while let Some(name) = queue.pop_front() {
         if !prod_names.insert(name.clone()) {
             continue;
@@ -251,18 +265,28 @@ pub async fn resolve(
     })
 }
 
+enum PrefetchHit {
+    Found {
+        name: String,
+        versions: Vec<composer_repo::RemotePackageVersion>,
+    },
+    /// Packagist/GitLab 404 — may still be a `provide` / `replace` virtual.
+    Missing(String),
+}
+
 async fn prefetch_remote(
     registry: &RepositoryRegistry,
     index: &mut PackageIndex,
     roots: &[(PackageId, VersionConstraint)],
     options: &ResolveOptions,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::collections::VecDeque;
     use std::sync::Arc;
 
     let mut queue: VecDeque<String> = roots.iter().map(|(id, _)| id.to_string()).collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut missing = BTreeSet::new();
 
     while !queue.is_empty() {
         let mut wave = Vec::new();
@@ -305,26 +329,40 @@ async fn prefetch_remote(
             futs.push(async move {
                 let _p = sem.acquire().await.ok();
                 let id = PackageId::parse(&name)?;
-                let versions = registry.get_package_versions(&id).await?;
-                Ok::<_, Error>((name, versions))
+                match registry.get_package_versions(&id).await {
+                    Ok(versions) => Ok(PrefetchHit::Found { name, versions }),
+                    Err(Error::PackageNotFound(_)) => Ok(PrefetchHit::Missing(name)),
+                    Err(e) => Err(e),
+                }
             });
         }
 
         while let Some(res) = futs.next().await {
-            let (name, versions) = res?;
-            for v in &versions {
-                for dep in v.require.keys() {
-                    let id = PackageId::parse(dep).ok();
-                    if id.as_ref().is_some_and(|p| !p.is_platform()) && !seen.contains(dep) {
-                        queue.push_back(dep.clone());
+            match res? {
+                PrefetchHit::Missing(name) => {
+                    missing.insert(name);
+                }
+                PrefetchHit::Found { name, versions } => {
+                    for v in &versions {
+                        for virt in v.provide.keys().chain(v.replace.keys()) {
+                            seen.insert(virt.clone());
+                            missing.remove(virt);
+                        }
+                        for dep in v.require.keys() {
+                            let id = PackageId::parse(dep).ok();
+                            if id.as_ref().is_some_and(|p| !p.is_platform()) && !seen.contains(dep)
+                            {
+                                queue.push_back(dep.clone());
+                            }
+                        }
                     }
+                    index.insert_remote(&name, versions);
                 }
             }
-            index.insert_remote(&name, versions);
         }
     }
 
-    Ok(())
+    Ok(missing)
 }
 
 /// Build a map of package name → locked package from an existing lock.

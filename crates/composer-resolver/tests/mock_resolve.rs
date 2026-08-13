@@ -644,3 +644,104 @@ async fn resolve_uses_project_auth_json() {
     assert_eq!(resolution.packages[0].name, "acme/private");
     assert_eq!(resolution.packages[0].version, "1.0.0");
 }
+
+fn p2_with_provide(name: &str, ver: &str, require: &str, provide: &str) -> String {
+    format!(
+        r#"{{
+            "packages": {{
+                "{name}": [{{
+                    "version": "{ver}",
+                    "version_normalized": "{ver}.0",
+                    "dist": {{
+                        "type": "zip",
+                        "url": "https://example.com/{name}-{ver}.zip",
+                        "reference": "{ver}"
+                    }},
+                    "require": {require},
+                    "provide": {provide},
+                    "type": "library"
+                }}]
+            }}
+        }}"#
+    )
+}
+
+/// Root requires a concrete package and a virtual `*-implementation`.
+/// The virtual name has no p2 document (404); it must be satisfied via `provide`.
+#[tokio::test]
+async fn resolve_virtual_package_via_provide() {
+    let _cache = CacheEnvGuard::new().await;
+    let server = MockServer::start().await;
+    mount_p2(
+        &server,
+        "guzzlehttp/guzzle",
+        &p2_with_provide(
+            "guzzlehttp/guzzle",
+            "7.9.0",
+            r#"{ "php": ">=7.2.5" }"#,
+            r#"{ "psr/http-client-implementation": "1.0" }"#,
+        ),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/p2/psr/http-client-implementation.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let manifest_json = app_manifest(
+        &server.uri(),
+        r#""guzzlehttp/guzzle": "^7.0", "psr/http-client-implementation": "*""#,
+    );
+    let manifest = ComposerJson::from_str(&manifest_json).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("composer.json"), &manifest_json).unwrap();
+
+    let resolution = resolve(
+        &manifest,
+        &opts(&[], UpdateDeps::OnlyListed),
+        tmp.path(),
+        None,
+    )
+    .await
+    .expect("virtual provide should resolve");
+
+    assert_eq!(resolution.packages.len(), 1, "{:?}", resolution.packages);
+    assert_eq!(resolution.packages[0].name, "guzzlehttp/guzzle");
+    assert_eq!(resolution.packages[0].version, "7.9.0");
+    assert!(
+        resolution
+            .all_packages()
+            .all(|p| p.name != "psr/http-client-implementation")
+    );
+}
+
+#[tokio::test]
+async fn missing_virtual_without_provider_is_not_found() {
+    let _cache = CacheEnvGuard::new().await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/p2/psr/http-client-implementation.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let manifest_json = app_manifest(&server.uri(), r#""psr/http-client-implementation": "*""#);
+    let manifest = ComposerJson::from_str(&manifest_json).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("composer.json"), &manifest_json).unwrap();
+
+    let err = resolve(
+        &manifest,
+        &opts(&[], UpdateDeps::OnlyListed),
+        tmp.path(),
+        None,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("psr/http-client-implementation"),
+        "unexpected error: {msg}"
+    );
+}
