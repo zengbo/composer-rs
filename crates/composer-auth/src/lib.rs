@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 use url::Url;
 
 /// Credential store used for HTTP repository and dist downloads.
@@ -17,10 +18,11 @@ pub struct AuthStore {
     pub http_basic: BTreeMap<String, HttpBasic>,
     #[serde(rename = "github-oauth", default)]
     pub github_oauth: BTreeMap<String, String>,
+    /// Personal access token (string) or deploy/CI token (`{username, token}`).
     #[serde(rename = "gitlab-token", default)]
-    pub gitlab_token: BTreeMap<String, String>,
+    pub gitlab_token: BTreeMap<String, GitlabToken>,
     #[serde(rename = "gitlab-oauth", default)]
-    pub gitlab_oauth: BTreeMap<String, String>,
+    pub gitlab_oauth: BTreeMap<String, GitlabOauth>,
     #[serde(rename = "bearer", default)]
     pub bearer: BTreeMap<String, String>,
     #[serde(flatten)]
@@ -33,6 +35,43 @@ pub struct HttpBasic {
     pub password: String,
 }
 
+/// `auth.json` `gitlab-token.<host>`: a PAT string or deploy/CI object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GitlabToken {
+    /// `composer config gitlab-token.example.com <pat>`
+    Personal(String),
+    /// Deploy token / CI job token: `{ "username": "...", "token": "..." }`.
+    Pair {
+        username: String,
+        #[serde(alias = "password")]
+        token: String,
+    },
+}
+
+/// `gitlab-oauth.<host>`: access token string or Composer refresh object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GitlabOauth {
+    Token(String),
+    Refresh {
+        token: String,
+        #[serde(rename = "expires-at", default)]
+        expires_at: Option<i64>,
+        #[serde(rename = "refresh-token", default)]
+        refresh_token: Option<String>,
+    },
+}
+
+impl GitlabOauth {
+    fn access_token(&self) -> &str {
+        match self {
+            Self::Token(t) => t,
+            Self::Refresh { token, .. } => token,
+        }
+    }
+}
+
 /// Resolved auth for a single host.
 #[derive(Debug, Clone)]
 pub enum HostAuth {
@@ -41,33 +80,67 @@ pub enum HostAuth {
     TokenHeader { name: &'static str, value: String },
 }
 
+impl GitlabToken {
+    /// Composer `GitLab::authorizeOAuth` + `AuthHelper::addAuthenticationOptions`.
+    fn to_host_auth(&self) -> HostAuth {
+        match self {
+            Self::Personal(token) => HostAuth::TokenHeader {
+                name: "PRIVATE-TOKEN",
+                value: token.clone(),
+            },
+            Self::Pair { username, token } => {
+                // Composer stores PAT as username=token, password=private-token.
+                // If those two are reversed, it swaps them.
+                let (identity, kind) = if is_gitlab_token_kind(username) {
+                    (token.as_str(), username.as_str())
+                } else if is_gitlab_token_kind(token) {
+                    (username.as_str(), token.as_str())
+                } else {
+                    return HostAuth::Basic {
+                        username: username.clone(),
+                        password: token.clone(),
+                    };
+                };
+                match kind {
+                    "oauth2" => HostAuth::Bearer(identity.to_string()),
+                    _ => HostAuth::TokenHeader {
+                        name: "PRIVATE-TOKEN",
+                        value: identity.to_string(),
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn is_gitlab_token_kind(s: &str) -> bool {
+    matches!(s, "private-token" | "gitlab-ci-token" | "oauth2")
+}
+
 impl AuthStore {
-    /// Load and merge: env `COMPOSER_AUTH` → project auth.json → global auth.json.
+    /// Load and merge: env `COMPOSER_AUTH` → project auth.json → Composer global auth.json.
     /// Later sources only fill keys not already set (env wins).
     pub fn load(project_root: Option<&Path>) -> Result<Self> {
         let mut store = AuthStore::default();
 
         if let Ok(raw) = std::env::var("COMPOSER_AUTH") {
-            if let Ok(env_store) = serde_json::from_str::<AuthStore>(&raw) {
-                store.merge_prefer_self(env_store);
+            match serde_json::from_str::<AuthStore>(&raw) {
+                Ok(env_store) => store.merge_prefer_self(env_store),
+                Err(e) => warn!(error = %e, "COMPOSER_AUTH is not valid JSON"),
             }
         }
 
         if let Some(root) = project_root {
             let local = root.join("auth.json");
-            if local.is_file() {
-                if let Ok(s) = Self::from_file(&local) {
-                    store.merge_prefer_self(s);
-                }
-            }
+            merge_file(&mut store, &local);
         }
 
-        if let Some(global) = global_auth_path() {
-            if global.is_file() {
-                if let Ok(s) = Self::from_file(&global) {
-                    store.merge_prefer_self(s);
-                }
+        let mut seen = std::collections::BTreeSet::new();
+        for path in global_auth_candidates() {
+            if !seen.insert(path.clone()) {
+                continue;
             }
+            merge_file(&mut store, &path);
         }
 
         Ok(store)
@@ -111,23 +184,22 @@ impl AuthStore {
     }
 
     pub fn for_host(&self, host: &str) -> Option<HostAuth> {
-        if let Some(b) = self.http_basic.get(host) {
+        let bare = host.split(':').next().unwrap_or(host);
+        // GitLab tokens first: Composer treats gitlab-token as the API credential
+        // (PRIVATE-TOKEN / Bearer / deploy-token basic). http-basic is a fallback.
+        if let Some(t) = lookup_host_map(&self.gitlab_token, host, bare) {
+            return Some(t.to_host_auth());
+        }
+        if let Some(t) = lookup_host_map(&self.gitlab_oauth, host, bare) {
+            return Some(HostAuth::Bearer(t.access_token().to_string()));
+        }
+        if let Some(b) = lookup_host_map(&self.http_basic, host, bare) {
             return Some(HostAuth::Basic {
                 username: b.username.clone(),
                 password: b.password.clone(),
             });
         }
-        // try without port
-        let bare = host.split(':').next().unwrap_or(host);
-        if bare != host {
-            if let Some(b) = self.http_basic.get(bare) {
-                return Some(HostAuth::Basic {
-                    username: b.username.clone(),
-                    password: b.password.clone(),
-                });
-            }
-        }
-        if let Some(t) = self.bearer.get(host).or_else(|| self.bearer.get(bare)) {
+        if let Some(t) = lookup_host_map(&self.bearer, host, bare) {
             return Some(HostAuth::Bearer(t.clone()));
         }
         if let Some(t) = self
@@ -142,23 +214,6 @@ impl AuthStore {
                     value: format!("token {t}"),
                 });
             }
-        }
-        if let Some(t) = self
-            .gitlab_token
-            .get(host)
-            .or_else(|| self.gitlab_token.get(bare))
-        {
-            return Some(HostAuth::TokenHeader {
-                name: "PRIVATE-TOKEN",
-                value: t.clone(),
-            });
-        }
-        if let Some(t) = self
-            .gitlab_oauth
-            .get(host)
-            .or_else(|| self.gitlab_oauth.get(bare))
-        {
-            return Some(HostAuth::Bearer(t.clone()));
         }
         None
     }
@@ -180,6 +235,24 @@ impl AuthStore {
     }
 }
 
+fn lookup_host_map<'a, T>(map: &'a BTreeMap<String, T>, host: &str, bare: &str) -> Option<&'a T> {
+    map.get(host).or_else(|| map.get(bare)).or_else(|| {
+        // auth.json keys sometimes include a scheme (rare but seen in the wild).
+        map.get(&format!("https://{host}"))
+            .or_else(|| map.get(&format!("https://{bare}")))
+    })
+}
+
+fn merge_file(store: &mut AuthStore, path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    match AuthStore::from_file(path) {
+        Ok(s) => store.merge_prefer_self(s),
+        Err(e) => warn!(path = %path.display(), error = %e, "failed to parse auth.json"),
+    }
+}
+
 fn host_key(url: &str) -> Option<String> {
     let u = Url::parse(url).ok()?;
     let host = u.host_str()?;
@@ -189,12 +262,62 @@ fn host_key(url: &str) -> Option<String> {
     }
 }
 
-/// Composer global auth.json path (`$COMPOSER_HOME/auth.json` or XDG).
-pub fn global_auth_path() -> Option<PathBuf> {
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()))
+}
+
+/// Composer home directory (`$COMPOSER_HOME`, else `~/.composer` if present, else XDG).
+///
+/// Matches `Composer\Factory::getComposerHome` — **not** macOS Application Support.
+pub fn composer_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("COMPOSER_HOME") {
-        return Some(PathBuf::from(home).join("auth.json"));
+        if !home.is_empty() {
+            return Some(PathBuf::from(home));
+        }
     }
-    directories::BaseDirs::new().map(|d| d.config_dir().join("composer").join("auth.json"))
+    #[cfg(windows)]
+    {
+        return std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Composer"));
+    }
+    #[cfg(not(windows))]
+    {
+        let home = user_home()?;
+        let legacy = home.join(".composer");
+        if legacy.is_dir() {
+            return Some(legacy);
+        }
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("composer"));
+            }
+        }
+        Some(home.join(".config").join("composer"))
+    }
+}
+
+/// Composer global auth.json path (`$COMPOSER_HOME/auth.json` or XDG / `~/.composer`).
+pub fn global_auth_path() -> Option<PathBuf> {
+    composer_home().map(|h| h.join("auth.json"))
+}
+
+/// All plausible Composer auth.json locations (first existing files are merged).
+fn global_auth_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(p) = global_auth_path() {
+        out.push(p);
+    }
+    if let Some(home) = user_home() {
+        out.push(home.join(".composer").join("auth.json"));
+        out.push(home.join(".config").join("composer").join("auth.json"));
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            out.push(PathBuf::from(xdg).join("composer").join("auth.json"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -236,5 +359,115 @@ mod tests {
             _ => panic!("missing h"),
         }
         assert!(a.for_host("other").is_some());
+    }
+
+    #[test]
+    fn gitlab_personal_token_sends_private_token_header() {
+        let store =
+            AuthStore::from_str(r#"{"gitlab-token":{"gitlab.rightcapital.io":"glpat-secret"}}"#)
+                .unwrap();
+        match store.for_url(
+            "https://gitlab.rightcapital.io/api/v4/projects/274/packages/composer/archives/pkg.zip?sha=abc",
+        ) {
+            Some(HostAuth::TokenHeader { name, value }) => {
+                assert_eq!(name, "PRIVATE-TOKEN");
+                assert_eq!(value, "glpat-secret");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitlab_deploy_token_object_is_http_basic() {
+        let store = AuthStore::from_str(
+            r#"{
+                "gitlab-token": {
+                    "gitlab.example.com": {
+                        "username": "gitlab+deploy-token-1",
+                        "token": "gldt-xxx"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        match store.for_host("gitlab.example.com") {
+            Some(HostAuth::Basic { username, password }) => {
+                assert_eq!(username, "gitlab+deploy-token-1");
+                assert_eq!(password, "gldt-xxx");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitlab_ci_job_token_object_is_private_token() {
+        let store = AuthStore::from_str(
+            r#"{
+                "gitlab-token": {
+                    "gitlab.example.com": {
+                        "username": "gitlab-ci-token",
+                        "token": "ci-job"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        match store.for_host("gitlab.example.com") {
+            Some(HostAuth::TokenHeader { name, value }) => {
+                assert_eq!(name, "PRIVATE-TOKEN");
+                assert_eq!(value, "ci-job");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitlab_oauth_object_is_bearer() {
+        let store = AuthStore::from_str(
+            r#"{
+                "gitlab-oauth": {
+                    "gitlab.example.com": {
+                        "token": "oauth-access",
+                        "expires-at": 9999999999,
+                        "refresh-token": "r"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        match store.for_host("gitlab.example.com") {
+            Some(HostAuth::Bearer(t)) => assert_eq!(t, "oauth-access"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_gitlab_object_does_not_drop_http_basic() {
+        let store = AuthStore::from_str(
+            r#"{
+                "http-basic": {"packagist.org": {"username": "u", "password": "p"}},
+                "gitlab-token": {
+                    "gitlab.example.com": {"username": "gitlab+deploy-token-1", "token": "t"}
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(store.for_host("packagist.org").is_some());
+        assert!(store.for_host("gitlab.example.com").is_some());
+    }
+
+    #[test]
+    fn gitlab_token_wins_over_http_basic_on_same_host() {
+        let store = AuthStore::from_str(
+            r#"{
+                "http-basic": {"gitlab.example.com": {"username": "u", "password": "p"}},
+                "gitlab-token": {"gitlab.example.com": "glpat-preferred"}
+            }"#,
+        )
+        .unwrap();
+        match store.for_host("gitlab.example.com") {
+            Some(HostAuth::TokenHeader { value, .. }) => assert_eq!(value, "glpat-preferred"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

@@ -13,14 +13,9 @@ pub struct GlobalArgs {
     pub args: Vec<String>,
 }
 
-/// Global project directory (`$COMPOSER_HOME` or XDG config `composer`).
+/// Global project directory (`$COMPOSER_HOME`, `~/.composer`, or XDG `composer`).
 pub fn global_home() -> PathBuf {
-    if let Ok(h) = std::env::var("COMPOSER_HOME") {
-        return PathBuf::from(h);
-    }
-    directories::BaseDirs::new()
-        .map(|d| d.config_dir().join("composer"))
-        .unwrap_or_else(|| PathBuf::from(".composer"))
+    composer_auth::composer_home().unwrap_or_else(|| PathBuf::from(".composer"))
 }
 
 pub fn run(args: GlobalArgs) -> Result<()> {

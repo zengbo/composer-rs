@@ -1,6 +1,7 @@
 //! End-to-end: resolve → install → vendor/ (+ autoload).
 //! Offline only: path repos and wiremock-served dist zips.
 
+use composer_auth::{AuthStore, GitlabToken};
 use composer_autoload::{AutoloadOptions, generate};
 use composer_cache::CasCache;
 use composer_download::PackageInstaller;
@@ -11,7 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Serialize mutations of `COMPOSER_RS_CACHE` without holding `std::sync` locks across await.
@@ -341,12 +342,22 @@ async fn install_one_pkg(
     cache_dir: &Path,
     pkg: &LockedPackage,
 ) -> composer_core::error::Result<()> {
+    install_one_pkg_auth(app, cache_dir, pkg, AuthStore::default()).await
+}
+
+async fn install_one_pkg_auth(
+    app: &Path,
+    cache_dir: &Path,
+    pkg: &LockedPackage,
+    auth: AuthStore,
+) -> composer_core::error::Result<()> {
     let vendor = app.join("vendor");
     fs::create_dir_all(&vendor).unwrap();
     let installer = PackageInstaller::new(2, false)
         .expect("installer")
         .with_project_root(app)
-        .with_cache(CasCache::with_root(cache_dir));
+        .with_cache(CasCache::with_root(cache_dir))
+        .with_auth(auth);
     installer.install_all(&[pkg], &vendor).await
 }
 
@@ -537,4 +548,47 @@ async fn e2e_resolve_preserves_p2_mirrors_and_fails_over() {
         hit.is_file(),
         "resolve+install should download the p2 mirror after primary 503"
     );
+}
+
+#[tokio::test]
+async fn e2e_dist_sends_gitlab_private_token() {
+    let cache_env = CacheEnvGuard::new().await;
+    let server = MockServer::start().await;
+    let zip_bytes = zip_lib("acme/private-lib", "Secret");
+
+    Mock::given(method("GET"))
+        .and(path("/dist/private.zip"))
+        .and(header("PRIVATE-TOKEN", "glpat-test"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/zip")
+                .set_body_bytes(zip_bytes),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+
+    let host = server
+        .uri()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let mut auth = AuthStore::default();
+    auth.gitlab_token
+        .insert(host, GitlabToken::Personal("glpat-test".into()));
+
+    let pkg = locked_dist(
+        "acme/private-lib",
+        &format!("{}/dist/private.zip", server.uri()),
+        None,
+    );
+    install_one_pkg_auth(&app, &cache_env.cas_root(), &pkg, auth)
+        .await
+        .expect("install with gitlab-token");
+
+    assert!(app.join("vendor/acme/private-lib/src/Secret.php").is_file());
 }
