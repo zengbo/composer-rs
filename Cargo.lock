@@ -321,7 +321,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "composer-auth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "composer-core",
  "directories",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "composer-autoload"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "composer-core",
  "composer-lock",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "composer-cache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "composer-core",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "composer-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "composer-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "blake3",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "composer-download"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "bytes",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "composer-lock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "composer-core",
  "composer-manifest",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "composer-manifest"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "composer-core",
  "composer-php-json",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "composer-repo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "composer-auth",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "composer-resolver"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "composer-auth",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "composer-scripts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "composer-autoload",
  "composer-core",
