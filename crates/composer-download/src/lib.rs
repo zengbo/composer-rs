@@ -5,6 +5,7 @@
 mod archive;
 mod bins;
 mod extract;
+mod progress;
 
 pub use archive::ArchiveType;
 pub use bins::install_bins;
@@ -16,6 +17,7 @@ use composer_core::error::{Error, Result};
 use composer_lock::LockedPackage;
 use composer_manifest::InstallerPaths;
 use futures::stream::{FuturesUnordered, StreamExt};
+use progress::InstallProgress;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -153,13 +155,28 @@ impl PackageInstaller {
 
         self.stats.total.store(packages.len(), Ordering::Relaxed);
 
-        for pkg in packages {
-            if pkg.is_metapackage() {
-                debug!(name = %pkg.name, "skipping metapackage");
-                self.stats.skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+        let work: Vec<&LockedPackage> = packages
+            .iter()
+            .copied()
+            .filter(|p| !p.is_metapackage())
+            .collect();
+        let skipped = packages.len().saturating_sub(work.len());
+        if skipped > 0 {
+            self.stats.skipped.fetch_add(skipped, Ordering::Relaxed);
+        }
 
+        let progress = InstallProgress::maybe(work.len() as u64).map(Arc::new);
+        struct ProgressGuard(Option<Arc<InstallProgress>>);
+        impl Drop for ProgressGuard {
+            fn drop(&mut self) {
+                if let Some(p) = &self.0 {
+                    p.finish();
+                }
+            }
+        }
+        let _progress_guard = ProgressGuard(progress.clone());
+
+        for pkg in work {
             let sem = Arc::clone(&sem);
             let http = self.http.clone();
             let cache = self.cache.clone();
@@ -167,14 +184,18 @@ impl PackageInstaller {
             let vendor_dir = vendor_dir.to_path_buf();
             let project_root = self.project_root.clone();
             let installer_paths = self.installer_paths.clone();
-            let pkg = (*pkg).clone();
+            let pkg = pkg.clone();
             let verify = self.verify_checksums;
             let prefer_dist = self.prefer_dist;
             let auth = self.auth.clone();
+            let progress = progress.clone();
 
             futs.push(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
-                install_one(
+                if let Some(p) = &progress {
+                    p.begin(&pkg.name);
+                }
+                let res = install_one(
                     &http,
                     &cache,
                     &stats,
@@ -185,8 +206,13 @@ impl PackageInstaller {
                     verify,
                     prefer_dist,
                     &auth,
+                    progress.as_deref(),
                 )
-                .await
+                .await;
+                if let Some(p) = &progress {
+                    p.end(&pkg.name);
+                }
+                res
             });
         }
 
@@ -238,6 +264,7 @@ async fn install_one(
     verify_checksums: bool,
     prefer_dist: bool,
     auth: &AuthStore,
+    progress: Option<&InstallProgress>,
 ) -> Result<()> {
     let dest = package_dest(pkg, vendor_dir, project_root, installer_paths)?;
 
@@ -250,8 +277,17 @@ async fn install_one(
                 if source.source_type == "git" || source.source_type == "vcs" {
                     install_vcs_package(pkg, &dest, source, stats).await
                 } else if pkg.dist_url().is_some() {
-                    install_dist_package(http, cache, stats, pkg, &dest, verify_checksums, auth)
-                        .await
+                    install_dist_package(
+                        http,
+                        cache,
+                        stats,
+                        pkg,
+                        &dest,
+                        verify_checksums,
+                        auth,
+                        progress,
+                    )
+                    .await
                 } else {
                     Err(Error::other(format!(
                         "package {} has no installable source",
@@ -259,7 +295,17 @@ async fn install_one(
                     )))
                 }
             } else if pkg.dist_url().is_some() {
-                install_dist_package(http, cache, stats, pkg, &dest, verify_checksums, auth).await
+                install_dist_package(
+                    http,
+                    cache,
+                    stats,
+                    pkg,
+                    &dest,
+                    verify_checksums,
+                    auth,
+                    progress,
+                )
+                .await
             } else {
                 Err(Error::other(format!(
                     "package {} has no dist URL and no installable source",
@@ -267,7 +313,17 @@ async fn install_one(
                 )))
             }
         } else if pkg.dist_url().is_some() {
-            install_dist_package(http, cache, stats, pkg, &dest, verify_checksums, auth).await
+            install_dist_package(
+                http,
+                cache,
+                stats,
+                pkg,
+                &dest,
+                verify_checksums,
+                auth,
+                progress,
+            )
+            .await
         } else if let Some(source) = &pkg.source {
             if source.source_type == "git" || source.source_type == "vcs" {
                 install_vcs_package(pkg, &dest, source, stats).await
@@ -339,6 +395,7 @@ async fn install_dist_package(
     dest: &Path,
     verify_checksums: bool,
     auth: &AuthStore,
+    progress: Option<&InstallProgress>,
 ) -> Result<()> {
     let key = pkg.cache_key();
 
@@ -363,13 +420,19 @@ async fn install_dist_package(
     let mut last_err = None;
     let mut archive_path = None;
     for url in &urls {
-        match download_to_archives(http, url, &pkg.name, auth).await {
+        match download_to_archives(http, url, &pkg.name, auth, progress).await {
             Ok(p) => {
                 archive_path = Some(p);
                 break;
             }
             Err(e) => {
-                warn!(package = %pkg.name, %url, error = %e, "dist download failed, trying next mirror");
+                let log = || {
+                    warn!(package = %pkg.name, %url, error = %e, "dist download failed, trying next mirror");
+                };
+                match progress {
+                    Some(p) => p.suspend(log),
+                    None => log(),
+                }
                 last_err = Some(e);
             }
         }
@@ -445,6 +508,7 @@ async fn download_to_archives(
     url: &str,
     package_name: &str,
     auth: &AuthStore,
+    progress: Option<&InstallProgress>,
 ) -> Result<PathBuf> {
     let dir = archives_dir();
     std::fs::create_dir_all(&dir).map_err(|e| Error::io(dir.as_path(), e))?;
@@ -464,18 +528,24 @@ async fn download_to_archives(
 
     loop {
         attempt += 1;
-        match download_file(http, url, &partial, auth).await {
+        match download_file(http, url, &partial, auth, progress).await {
             Ok(()) => {
                 std::fs::rename(&partial, &path).map_err(|e| Error::io(&path, e))?;
                 return Ok(path);
             }
             Err(e) if attempt < max_attempts => {
-                warn!(
-                    package = %package_name,
-                    attempt,
-                    error = %e,
-                    "download failed, retrying"
-                );
+                let log = || {
+                    warn!(
+                        package = %package_name,
+                        attempt,
+                        error = %e,
+                        "download failed, retrying"
+                    );
+                };
+                match progress {
+                    Some(p) => p.suspend(log),
+                    None => log(),
+                }
                 let backoff = Duration::from_millis(200 * 2u64.pow(attempt - 1));
                 tokio::time::sleep(backoff).await;
             }
@@ -489,6 +559,7 @@ async fn download_file(
     url: &str,
     dest: &Path,
     auth: &AuthStore,
+    progress: Option<&InstallProgress>,
 ) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
@@ -509,9 +580,11 @@ async fn download_file(
         .map_err(|e| Error::io(dest, e))?;
 
     let mut stream = resp.bytes_stream();
-    use futures::StreamExt;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| Error::download(url, e.to_string()))?;
+        if let Some(p) = progress {
+            p.add_bytes(chunk.len() as u64);
+        }
         file.write_all(&chunk)
             .await
             .map_err(|e| Error::io(dest, e))?;
