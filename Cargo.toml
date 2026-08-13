@@ -82,6 +82,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 pubgrub = "0.3"
 version-ranges = "0.1"
 md5 = "0.7"
+composer-php-json = "0.2.0"
 wiremock = "0.6"
 
 [profile.release]

@@ -80,13 +80,15 @@ fn resolve_opts() -> ResolveOptions {
 
 async fn resolve_and_install(app_dir: &Path, cache_dir: &Path) -> (ComposerLock, PathBuf) {
     let manifest_path = app_dir.join("composer.json");
-    let manifest = ComposerJson::load(&manifest_path).expect("load composer.json");
+    let composer_json_bytes = fs::read(&manifest_path).expect("read composer.json");
+    let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes).unwrap())
+        .expect("load composer.json");
     let options = resolve_opts();
 
     let resolution = resolve(&manifest, &options, app_dir, None)
         .await
         .expect("resolve");
-    let lock = resolution.to_lock(&manifest);
+    let lock = resolution.to_lock(&manifest, &composer_json_bytes);
 
     let vendor = app_dir.join("vendor");
     fs::create_dir_all(&vendor).unwrap();

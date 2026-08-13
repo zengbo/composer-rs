@@ -1,7 +1,7 @@
 //! `composer-rs validate`
 
 use super::{header, project_paths, success, warning};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Args;
 use composer_core::{PackageId, VersionConstraint};
 use composer_lock::ComposerLock;
@@ -24,7 +24,9 @@ pub fn run(args: ValidateArgs) -> Result<()> {
         bail!("composer.json not found");
     }
 
-    let manifest = ComposerJson::load(&json_path)?;
+    let composer_json_bytes =
+        std::fs::read(&json_path).with_context(|| format!("read {}", json_path.display()))?;
+    let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes)?)?;
     let mut warnings = 0usize;
 
     if let Some(name) = &manifest.name {
@@ -70,9 +72,7 @@ pub fn run(args: ValidateArgs) -> Result<()> {
     if !args.no_check_lock && lock_path.exists() {
         let lock = ComposerLock::load(&lock_path)?;
         success("composer.lock is valid JSON");
-        let expected = composer_lock::content_hash_from_relevant(
-            &composer_manifest::relevant_content(&manifest),
-        );
+        let expected = composer_lock::content_hash_from_composer_json(&composer_json_bytes)?;
         if lock.content_hash.is_empty() {
             warning("composer.lock is missing content-hash");
             warnings += 1;

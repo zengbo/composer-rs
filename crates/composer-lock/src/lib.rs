@@ -283,9 +283,9 @@ pub enum License {
     Many(Vec<String>),
 }
 
-/// Compute Composer-compatible content-hash (MD5 of relevant composer.json fields).
-pub fn content_hash_from_relevant(relevant_json: &str) -> String {
-    format!("{:x}", md5::compute(relevant_json.as_bytes()))
+/// Compute Composer-compatible content-hash from raw `composer.json` bytes.
+pub fn content_hash_from_composer_json(composer_json_bytes: &[u8]) -> composer_core::Result<String> {
+    composer_manifest::content_hash(composer_json_bytes)
 }
 
 #[cfg(test)]
@@ -370,9 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_is_md5_hex() {
-        let relevant = r#"{"require":{"symfony/console":"^6.0"}}"#;
-        let hash = content_hash_from_relevant(relevant);
+    fn content_hash_from_composer_json_is_md5_hex() {
+        let json = br#"{"require":{"symfony/console":"^6.0"}}"#;
+        let hash = content_hash_from_composer_json(json).unwrap();
         assert_eq!(hash.len(), 32);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }

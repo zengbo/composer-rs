@@ -8,6 +8,6 @@ description = "composer.lock read/write for composer-rs"
 
 [dependencies]
 composer-core = { workspace = true }
+composer-manifest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-md5 = { workspace = true }

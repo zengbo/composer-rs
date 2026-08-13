@@ -81,15 +81,14 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    pub fn to_lock(&self, manifest: &ComposerJson) -> ComposerLock {
+    pub fn to_lock(&self, manifest: &ComposerJson, composer_json_bytes: &[u8]) -> ComposerLock {
         let mut lock = ComposerLock::default();
         lock.packages = self.packages.clone();
         lock.packages_dev = self.packages_dev.clone();
         lock.minimum_stability = manifest.minimum_stability().to_string();
         lock.prefer_stable = manifest.prefer_stable();
-        lock.content_hash = composer_lock::content_hash_from_relevant(
-            &composer_manifest::relevant_content(manifest),
-        );
+        lock.content_hash = composer_lock::content_hash_from_composer_json(composer_json_bytes)
+            .expect("content_hash: composer.json already validated");
         for (k, v) in &manifest.require {
             let id = PackageId::parse(k).ok();
             if id.as_ref().is_some_and(|p| p.is_platform()) {

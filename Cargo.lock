@@ -447,7 +447,7 @@ name = "composer-lock"
 version = "0.1.0"
 dependencies = [
  "composer-core",
- "md5",
+ "composer-manifest",
  "serde",
  "serde_json",
 ]
@@ -457,7 +457,18 @@ name = "composer-manifest"
 version = "0.1.0"
 dependencies = [
  "composer-core",
+ "composer-php-json",
+ "md5",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "composer-php-json"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0740f88d25c9fcc53153cf3dcb2e65caea79bcf3d4c899a52dfab64d095c602"
+dependencies = [
  "serde_json",
 ]
 
@@ -1782,6 +1793,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

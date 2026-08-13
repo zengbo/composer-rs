@@ -1,7 +1,7 @@
 //! Integration: `update --lock` refreshes content-hash without changing packages.
 
 use composer_lock::ComposerLock;
-use composer_manifest::{ComposerJson, relevant_content};
+use composer_manifest::content_hash;
 use std::process::Command;
 
 #[test]
@@ -16,7 +16,6 @@ fn update_lock_rewrites_content_hash_only() {
     }"#;
     std::fs::write(root.join("composer.json"), manifest_json).unwrap();
 
-    let manifest = ComposerJson::from_str(manifest_json).unwrap();
     let mut lock = ComposerLock::default();
     lock.content_hash = "deadbeefdeadbeefdeadbeefdeadbeef".into();
     lock.packages = vec![];
@@ -31,7 +30,7 @@ fn update_lock_rewrites_content_hash_only() {
     assert!(status.success(), "update --lock should succeed");
 
     let updated = ComposerLock::load(&root.join("composer.lock")).unwrap();
-    let expected = composer_lock::content_hash_from_relevant(&relevant_content(&manifest));
+    let expected = content_hash(manifest_json.as_bytes()).unwrap();
     assert_eq!(updated.content_hash, expected);
     assert!(updated.packages.is_empty());
 }

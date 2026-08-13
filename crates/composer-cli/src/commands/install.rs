@@ -67,7 +67,10 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         bail!("composer.json not found in {}", cwd.display());
     }
 
-    let manifest = ComposerJson::load(&json_path).context("parse composer.json")?;
+    let composer_json_bytes =
+        std::fs::read(&json_path).with_context(|| format!("read {}", json_path.display()))?;
+    let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes)?)
+        .context("parse composer.json")?;
     let vendor = vendor_dir(&manifest, &cwd);
     let with_dev = !args.no_dev;
     let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
@@ -83,9 +86,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     let lock = if lock_path.exists() {
         info(&format!("Lock file: {}", lock_path.display()));
         let lock = ComposerLock::load(&lock_path).context("parse composer.lock")?;
-        let expected = composer_lock::content_hash_from_relevant(
-            &composer_manifest::relevant_content(&manifest),
-        );
+        let expected = composer_lock::content_hash_from_composer_json(&composer_json_bytes)?;
         if !lock.content_hash.is_empty() && lock.content_hash != expected {
             warning(&format!(
                 "composer.lock content-hash mismatch (lock={}, computed={expected}) — run update",
@@ -109,7 +110,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         let resolution = resolve(&manifest, &options, &cwd, None)
             .await
             .context("dependency resolution (PubGrub)")?;
-        let lock = resolution.to_lock(&manifest);
+        let lock = resolution.to_lock(&manifest, &composer_json_bytes);
         if !args.dry_run {
             lock.save(&lock_path)?;
             success(&format!("Wrote {}", lock_path.display()));

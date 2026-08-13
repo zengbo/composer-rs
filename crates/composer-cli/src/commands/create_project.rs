@@ -72,7 +72,10 @@ pub async fn run(args: CreateProjectArgs) -> Result<()> {
         return Ok(());
     }
 
-    let manifest = ComposerJson::load(&json_path)?;
+    let composer_json_bytes =
+        std::fs::read(&json_path).with_context(|| format!("read {}", json_path.display()))?;
+    let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes)?)
+        .context("parse composer.json")?;
     let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
     let options = ResolveOptions {
         with_dev: true,
@@ -88,7 +91,7 @@ pub async fn run(args: CreateProjectArgs) -> Result<()> {
     let resolution = resolve(&manifest, &options, &dir_name, None)
         .await
         .context("resolve project package")?;
-    let lock = resolution.to_lock(&manifest);
+    let lock = resolution.to_lock(&manifest, &composer_json_bytes);
     lock.save(&dir_name.join("composer.lock"))?;
 
     let vendor = dir_name.join(manifest.vendor_dir());

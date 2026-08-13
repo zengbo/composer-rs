@@ -82,7 +82,9 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         bail!("composer.json not found");
     }
 
-    let manifest = ComposerJson::load(&json_path)?;
+    let composer_json_bytes =
+        std::fs::read(&json_path).with_context(|| format!("read {}", json_path.display()))?;
+    let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes)?)?;
     let vendor = vendor_dir(&manifest, &cwd);
     let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
     let with_dev = !args.no_dev;
@@ -92,9 +94,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             bail!("composer.lock not found");
         }
         let mut lock = composer_lock::ComposerLock::load(&lock_path)?;
-        lock.content_hash = composer_lock::content_hash_from_relevant(
-            &composer_manifest::relevant_content(&manifest),
-        );
+        lock.content_hash = composer_lock::content_hash_from_composer_json(&composer_json_bytes)?;
         lock.save(&lock_path)?;
         success("Updated content-hash in composer.lock (--lock)");
         return Ok(());
@@ -153,7 +153,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     let resolution = resolve(&manifest, &options, &cwd, existing_lock.as_ref())
         .await
         .context("resolve (PubGrub)")?;
-    let lock = resolution.to_lock(&manifest);
+    let lock = resolution.to_lock(&manifest, &composer_json_bytes);
     let installer_paths = manifest.installer_paths();
 
     info(&format!(

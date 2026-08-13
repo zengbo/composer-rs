@@ -60,7 +60,9 @@ async fn e2e_path_install_bins_and_post_autoload_script() {
         }"#,
     );
 
-    let manifest = ComposerJson::load(&app.join("composer.json")).unwrap();
+    let composer_json_path = app.join("composer.json");
+    let composer_json_bytes = fs::read(&composer_json_path).unwrap();
+    let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes).unwrap()).unwrap();
     let options = ResolveOptions {
         with_dev: false,
         prefer_stable: true,
@@ -75,7 +77,7 @@ async fn e2e_path_install_bins_and_post_autoload_script() {
     let resolution = resolve(&manifest, &options, &app, None)
         .await
         .expect("resolve");
-    let lock = resolution.to_lock(&manifest);
+    let lock = resolution.to_lock(&manifest, &composer_json_bytes);
     let vendor = app.join("vendor");
     fs::create_dir_all(&vendor).unwrap();
 
