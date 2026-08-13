@@ -173,7 +173,7 @@ Path packages are **symlinked** into `vendor/` by default. VCS packages are clon
 - Installs dist archives from Packagist (zip / tar.gz / …)
 - Path + VCS repositories, `extra.installer-paths`, PubGrub resolution
 - Platform requirements (`php`, `ext-*`) with `config.platform` overrides
-- `vendor/bin` links, shell scripts (`post-autoload-dump`, `run-script`), auth.json
+- `vendor/bin` links, scripts (`post-autoload-dump`, `run-script`, `@php`, `Class::method`), auth.json
 - Generates a usable PSR-4 / classmap autoloader with `platform_check.php`
 - **Not supported:** PHP Composer plugins / Flex recipes (see [docs/adr/0001-plugin-execution.md](docs/adr/0001-plugin-execution.md) and [docs/symfony-flex-spike.md](docs/symfony-flex-spike.md) for hybrid CI workflows)
 - `install --audit` / `update --audit` **fail the command** (exit 1) when advisories are found

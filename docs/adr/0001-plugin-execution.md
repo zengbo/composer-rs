@@ -12,7 +12,7 @@ Composer plugins (`type: composer-plugin`) and Symfony Flex recipes require a PH
 
 composer-rs uses a **hybrid** approach:
 
-1. **Native path (default):** install packages, generate autoload, run shell/`@php` scripts, link bins, enforce `allow-plugins` as **warnings only**. Do not load or execute Composer plugins.
+1. **Native path (default):** install packages, generate autoload, run shell/`@php`/`Class::method` scripts, link bins, enforce `allow-plugins` as **warnings only**. Do not load or execute Composer plugins.
 2. **Documented escape hatch:** for plugin-heavy projects, run official Composer for install/update when plugins are required:
    ```bash
    composer install   # plugins / Flex

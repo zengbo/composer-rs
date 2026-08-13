@@ -507,7 +507,9 @@ dependencies = [
 name = "composer-scripts"
 version = "0.1.0"
 dependencies = [
+ "composer-autoload",
  "composer-core",
+ "composer-lock",
  "composer-manifest",
  "serde_json",
  "tempfile",

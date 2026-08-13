@@ -11,7 +11,7 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 | ❌ | Not implemented |
 | — | Intentionally out of scope |
 
-**Last reviewed:** 2026-08-12 (after Phase 5 polish: dist-mirror tests + doc sync)
+**Last reviewed:** 2026-08-13 (PHP `Class::method` callable scripts)
 
 ---
 
@@ -89,11 +89,11 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 | `config.bin-dir` | ✅ | ✅ | |
 | PSR-4 / PSR-0 autoload | ✅ | ✅ | |
 | `autoload-dev` | ✅ | ✅ | |
-| Classmap / files autoload | ✅ | ✅ | |
+| Classmap / files autoload | ✅ | ✅ | `files` ordered deps-first (Composer PackageSorter) |
 | `-o` / `--optimize-autoloader` | ✅ | ✅ | |
 | `-a` / `--classmap-authoritative` | ✅ | ✅ | |
 | APCu autoloader prefix | ✅ | ⚠️ | PHP stub exists, no CLI flag |
-| `vendor/autoload.php` | ✅ | ✅ | |
+| `vendor/autoload.php` | ✅ | ✅ | Ships Composer’s ClassLoader (incl. `$includeFile`) |
 | `installed.json` / `installed.php` | ✅ | ✅ | Composer 2 shape + version_normalized + install-path |
 | `platform_check.php` | ✅ | ✅ | |
 
@@ -103,14 +103,14 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 
 | Feature | Composer | composer-rs | Notes |
 |---------|----------|-------------|-------|
-| `scripts` in composer.json | ✅ | ✅ | Shell + `@script` + `@php` |
+| `scripts` in composer.json | ✅ | ✅ | Shell + `@script` + `@php` + `Class::method` |
 | Lifecycle: `pre/post-install-cmd` | ✅ | ✅ | |
 | Lifecycle: `pre/post-update-cmd` | ✅ | ✅ | |
 | Lifecycle: `pre/post-autoload-dump` | ✅ | ✅ | |
 | Per-package install/update scripts | ✅ | ❌ | |
 | `composer run-script` / `run` | ✅ | ✅ | |
 | Script `@references` | ✅ | ✅ | Cycle detection |
-| PHP `@callable` scripts | ✅ | ❌ | Use `@php` shell form |
+| PHP `@callable` scripts | ✅ | ✅ | `Class::method` via `php` + Event stub (`vendor-dir`, IO, `isDevMode`) |
 | `composer-plugin` packages | ✅ | ❌ | See [ADR 0001](adr/0001-plugin-execution.md) |
 | `config.allow-plugins` | ✅ | ⚠️ | Parsed; unapproved plugins warn |
 | Symfony Flex / recipes | ✅ | ❌ | Plugin-dependent |
@@ -259,7 +259,7 @@ These are **structural** gaps, not leftover checklist items:
 | Packagist `publish` / `archive` | Out of scope for the package-manager core. |
 | Replacing Composer in plugin-heavy monoliths | Hybrid: Composer for plugins/Flex, composer-rs for lock install. |
 
-Also not planned soon: APCu autoloader CLI flag, PHP `@callable` scripts (use `@php`), per-package install/update scripts.
+Also not planned soon: APCu autoloader CLI flag, Symfony Command-class scripts, per-package install/update scripts. PHP `Class::method` handlers get a stub `Composer\Script\Event` (enough for Laravel `ComposerScripts` and `Composer\Config::disableProcessTimeout`); they do not receive a full in-process Composer object.
 
 ---
 

@@ -62,13 +62,6 @@ pub fn install_bins(
                     warn!("{}", msg);
                     result.conflicts.push(msg);
                 }
-            } else if dest.exists() || dest.is_symlink() {
-                let msg = format!(
-                    "binary `{name}` already exists; overwriting with {}",
-                    pkg.name
-                );
-                warn!("{}", msg);
-                result.conflicts.push(msg);
             }
             if dest.exists() || dest.is_symlink() {
                 let _ = fs::remove_file(&dest);
@@ -233,5 +226,21 @@ mod tests {
         assert!(!res.conflicts.is_empty());
         let body = fs::read_to_string(vendor.join("bin/tool")).unwrap();
         assert_eq!(body, "b");
+    }
+
+    #[test]
+    fn reinstall_does_not_warn_when_bin_already_linked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join("vendor");
+        let pkg_dir = vendor.join("acme/tool");
+        fs::create_dir_all(pkg_dir.join("bin")).unwrap();
+        fs::write(pkg_dir.join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
+        let p = pkg("acme/tool", &["bin/hello"]);
+        let bin_dir = vendor.join("bin");
+        let paths = InstallerPaths::default();
+        install_bins(&[&p], &vendor, tmp.path(), &bin_dir, &paths).unwrap();
+        let again = install_bins(&[&p], &vendor, tmp.path(), &bin_dir, &paths).unwrap();
+        assert_eq!(again.linked, 1);
+        assert!(again.conflicts.is_empty());
     }
 }

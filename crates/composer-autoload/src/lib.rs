@@ -7,7 +7,7 @@ use composer_core::{AutoloadConfig, PackageId};
 use composer_lock::{ComposerLock, LockedPackage};
 use composer_manifest::ComposerJson;
 use regex::Regex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -49,7 +49,8 @@ pub fn generate(
     let mut classmap_dirs: Vec<String> = Vec::new();
     let mut classmap: BTreeMap<String, String> = BTreeMap::new();
 
-    // Root package autoload (paths relative to project root / vendor)
+    // Namespaces / classmap: root first so the app can override vendor prefixes
+    // (Composer parseAutoloads uses the reverse-sorted package map).
     if let Some(al) = &manifest.autoload {
         merge_autoload(
             al,
@@ -57,35 +58,34 @@ pub fn generate(
             true,
             &mut psr4,
             &mut psr0,
-            &mut files,
             &mut classmap_dirs,
         );
     }
     if options.with_dev {
         if let Some(al) = &manifest.autoload_dev {
-            merge_autoload(
-                al,
-                "",
-                true,
-                &mut psr4,
-                &mut psr0,
-                &mut files,
-                &mut classmap_dirs,
-            );
+            merge_autoload(al, "", true, &mut psr4, &mut psr0, &mut classmap_dirs);
         }
     }
 
-    // Locked packages
+    // Locked packages (PSR / classmap). `files` are collected separately so
+    // they can be ordered dependencies-first like Composer\Util\PackageSorter.
     if let Some(lock) = lock {
         for pkg in lock.packages_to_install(options.with_dev) {
-            collect_package_autoload(
-                pkg,
-                vendor_dir,
-                &mut psr4,
-                &mut psr0,
-                &mut files,
-                &mut classmap_dirs,
-            )?;
+            collect_package_autoload(pkg, &mut psr4, &mut psr0, &mut classmap_dirs)?;
+        }
+        let pkgs = lock.packages_to_install(options.with_dev);
+        for pkg in sort_packages_by_dependency_weight(&pkgs) {
+            append_files(&mut files, pkg.autoload.as_ref(), &pkg.name, false);
+        }
+    }
+
+    // Root `files` last so helpers can call vendor functions (Composer appends the root).
+    if let Some(al) = &manifest.autoload {
+        append_files(&mut files, Some(al), "", true);
+    }
+    if options.with_dev {
+        if let Some(al) = &manifest.autoload_dev {
+            append_files(&mut files, Some(al), "", true);
         }
     }
 
@@ -153,7 +153,6 @@ fn merge_autoload(
     is_root: bool,
     psr4: &mut BTreeMap<String, Vec<String>>,
     psr0: &mut BTreeMap<String, Vec<String>>,
-    files: &mut Vec<String>,
     classmap_dirs: &mut Vec<String>,
 ) {
     for (ns, paths) in &al.psr4 {
@@ -168,12 +167,77 @@ fn merge_autoload(
             psr0.entry(ns.clone()).or_default().push(rel);
         }
     }
-    for f in &al.files {
-        files.push(package_path(package_prefix, f, is_root));
-    }
     for d in &al.classmap {
         classmap_dirs.push(package_path(package_prefix, d, is_root));
     }
+}
+
+fn append_files(
+    files: &mut Vec<String>,
+    al: Option<&AutoloadConfig>,
+    package_prefix: &str,
+    is_root: bool,
+) {
+    let Some(al) = al else {
+        return;
+    };
+    for f in &al.files {
+        files.push(package_path(package_prefix, f, is_root));
+    }
+}
+
+/// Composer `PackageSorter::sortPackages`: lower weight (more dependents) first.
+fn sort_packages_by_dependency_weight<'a>(
+    packages: &[&'a LockedPackage],
+) -> Vec<&'a LockedPackage> {
+    let mut usage: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for pkg in packages {
+        for target in pkg.require.keys() {
+            usage
+                .entry(target.as_str())
+                .or_default()
+                .push(pkg.name.as_str());
+        }
+    }
+
+    fn importance(
+        name: &str,
+        usage: &BTreeMap<&str, Vec<&str>>,
+        computing: &mut BTreeSet<String>,
+        computed: &mut BTreeMap<String, i32>,
+    ) -> i32 {
+        if let Some(&w) = computed.get(name) {
+            return w;
+        }
+        if !computing.insert(name.to_string()) {
+            return 0;
+        }
+        let mut weight = 0i32;
+        if let Some(users) = usage.get(name) {
+            for user in users {
+                weight -= 1 - importance(user, usage, computing, computed);
+            }
+        }
+        computing.remove(name);
+        computed.insert(name.to_string(), weight);
+        weight
+    }
+
+    let mut computing = BTreeSet::new();
+    let mut computed = BTreeMap::new();
+    let mut weighted: Vec<(i32, &str, usize)> = packages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                importance(p.name.as_str(), &usage, &mut computing, &mut computed),
+                p.name.as_str(),
+                i,
+            )
+        })
+        .collect();
+    weighted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    weighted.into_iter().map(|(_, _, i)| packages[i]).collect()
 }
 
 fn package_path(package_install: &str, path: &str, is_root: bool) -> String {
@@ -194,15 +258,13 @@ fn package_path(package_install: &str, path: &str, is_root: bool) -> String {
 
 fn collect_package_autoload(
     pkg: &LockedPackage,
-    _vendor_dir: &Path,
     psr4: &mut BTreeMap<String, Vec<String>>,
     psr0: &mut BTreeMap<String, Vec<String>>,
-    files: &mut Vec<String>,
     classmap_dirs: &mut Vec<String>,
 ) -> Result<()> {
     let install = pkg.name.clone(); // vendor/name
     if let Some(al) = &pkg.autoload {
-        merge_autoload(al, &install, false, psr4, psr0, files, classmap_dirs);
+        merge_autoload(al, &install, false, psr4, psr0, classmap_dirs);
     }
     Ok(())
 }
@@ -312,8 +374,11 @@ fn extract_types(php: &str) -> Vec<String> {
     static TYPE_RE: OnceLock<Regex> = OnceLock::new();
     let ns_re = NS_RE.get_or_init(|| Regex::new(r"(?m)^\s*namespace\s+([^;{]+)").unwrap());
     let type_re = TYPE_RE.get_or_init(|| {
-        Regex::new(r"(?m)^\s*(?:abstract\s+|final\s+)?(?:class|interface|trait|enum)\s+(\w+)")
-            .unwrap()
+        // PHP 8.2+ allows `readonly` (and any order of abstract/final/readonly).
+        Regex::new(
+            r"(?m)^\s*(?:(?:abstract|final|readonly)\s+)*(?:class|interface|trait|enum)\s+(\w+)",
+        )
+        .unwrap()
     });
 
     let ns = ns_re
@@ -628,125 +693,13 @@ fn render_psr0_static(psr0: &BTreeMap<String, Vec<String>>) -> String {
 
 fn write_class_loader(dir: &Path) -> Result<()> {
     let path = dir.join("ClassLoader.php");
-    if path.exists() {
+    // Official Composer ClassLoader (MIT). Interceptors such as
+    // rightcapital/method-delegate bind to private static $includeFile.
+    const BODY: &str = include_str!("../php/ClassLoader.php");
+    if fs::read_to_string(&path).ok().as_deref() == Some(BODY) {
         return Ok(());
     }
-    // Minimal PSR-4/0/classmap ClassLoader compatible enough for most apps.
-    let body = r#"<?php
-// ClassLoader.php @generated by composer-rs (minimal)
-
-namespace Composer\Autoload;
-
-class ClassLoader
-{
-    public $prefixLengthsPsr4 = array();
-    public $prefixDirsPsr4 = array();
-    public $prefixesPsr0 = array();
-    public $classMap = array();
-    private $classMapAuthoritative = false;
-    private $useIncludePath = false;
-    private $apcuPrefix;
-
-    public function add($prefix, $paths, $prepend = false)
-    {
-        $paths = (array) $paths;
-        if (!$prefix) {
-            return;
-        }
-        if (!isset($this->prefixesPsr0[$prefix[0]][$prefix])) {
-            $this->prefixesPsr0[$prefix[0]][$prefix] = $paths;
-        } elseif ($prepend) {
-            $this->prefixesPsr0[$prefix[0]][$prefix] = array_merge($paths, $this->prefixesPsr0[$prefix[0]][$prefix]);
-        } else {
-            $this->prefixesPsr0[$prefix[0]][$prefix] = array_merge($this->prefixesPsr0[$prefix[0]][$prefix], $paths);
-        }
-    }
-
-    public function addPsr4($prefix, $paths, $prepend = false)
-    {
-        $paths = (array) $paths;
-        if (!isset($this->prefixDirsPsr4[$prefix])) {
-            $length = strlen($prefix);
-            if ('\\' !== $prefix[$length - 1]) {
-                throw new \InvalidArgumentException("A non-empty PSR-4 prefix must end with a namespace separator.");
-            }
-            $this->prefixLengthsPsr4[$prefix[0]][$prefix] = $length;
-            $this->prefixDirsPsr4[$prefix] = $paths;
-        } elseif ($prepend) {
-            $this->prefixDirsPsr4[$prefix] = array_merge($paths, $this->prefixDirsPsr4[$prefix]);
-        } else {
-            $this->prefixDirsPsr4[$prefix] = array_merge($this->prefixDirsPsr4[$prefix], $paths);
-        }
-    }
-
-    public function setClassMapAuthoritative($bool) { $this->classMapAuthoritative = (bool) $bool; }
-    public function setUseIncludePath($bool) { $this->useIncludePath = (bool) $bool; }
-    public function setApcuPrefix($prefix) { $this->apcuPrefix = $prefix; }
-
-    public function register($prepend = false)
-    {
-        spl_autoload_register(array($this, 'loadClass'), true, $prepend);
-    }
-
-    public function loadClass($class)
-    {
-        if ($file = $this->findFile($class)) {
-            includeFile($file);
-            return true;
-        }
-        return null;
-    }
-
-    public function findFile($class)
-    {
-        if (isset($this->classMap[$class])) {
-            return $this->classMap[$class];
-        }
-        if ($this->classMapAuthoritative) {
-            return false;
-        }
-
-        $logical = strtr($class, '\\', DIRECTORY_SEPARATOR) . '.php';
-
-        // PSR-4
-        $first = $class[0];
-        if (isset($this->prefixLengthsPsr4[$first])) {
-            foreach ($this->prefixLengthsPsr4[$first] as $prefix => $length) {
-                if (0 === strpos($class, $prefix)) {
-                    foreach ($this->prefixDirsPsr4[$prefix] as $dir) {
-                        $file = $dir . DIRECTORY_SEPARATOR . substr($logical, $length);
-                        if (file_exists($file)) {
-                            return $file;
-                        }
-                    }
-                }
-            }
-        }
-
-        // PSR-0
-        if (isset($this->prefixesPsr0[$first])) {
-            foreach ($this->prefixesPsr0[$first] as $prefix => $dirs) {
-                if (0 === strpos($class, $prefix)) {
-                    foreach ($dirs as $dir) {
-                        $file = $dir . DIRECTORY_SEPARATOR . $logical;
-                        if (file_exists($file)) {
-                            return $file;
-                        }
-                    }
-                }
-            }
-        }
-
-        return false;
-    }
-}
-
-function includeFile($file)
-{
-    include $file;
-}
-"#;
-    fs::write(&path, body).map_err(|e| Error::io(&path, e))
+    fs::write(&path, BODY).map_err(|e| Error::io(&path, e))
 }
 
 fn write_autoload_real(dir: &Path, classmap_authoritative: bool, optimize: bool) -> Result<()> {
@@ -772,8 +725,10 @@ class ComposerAutoloaderInit
         }}
 
         require __DIR__ . '/platform_check.php';
-        require __DIR__ . '/ClassLoader.php';
-        self::$loader = $loader = new \Composer\Autoload\ClassLoader();
+        if (!class_exists('Composer\\Autoload\\ClassLoader', false)) {{
+            require_once __DIR__ . '/ClassLoader.php';
+        }}
+        self::$loader = $loader = new \Composer\Autoload\ClassLoader(\dirname(__DIR__));
 
         $useStatic = {use_static};
         if ($useStatic) {{
@@ -792,7 +747,7 @@ class ComposerAutoloaderInit
 
             $classMap = require __DIR__ . '/autoload_classmap.php';
             if ($classMap) {{
-                $loader->classMap = $classMap + $loader->classMap;
+                $loader->addClassMap($classMap);
             }}
         }}
 
@@ -1148,5 +1103,241 @@ mod tests {
             "PSR-0 must nest under first character:\n{body}"
         );
         assert!(body.contains("'Foo' => array($vendorDir . '/foo/src')"));
+    }
+
+    #[test]
+    fn files_autoload_dependencies_before_dependents_and_root_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendor = root.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+
+        let mut safe = locked("thecodingmachine/safe", "2.0.0");
+        safe.autoload = Some(AutoloadConfig {
+            files: vec!["generated/filesystem.php".into()],
+            ..Default::default()
+        });
+
+        let mut fly = locked("rightcapital/flysystem-compress-adapter", "1.0.0");
+        fly.require
+            .insert("thecodingmachine/safe".into(), "^2".into());
+        fly.autoload = Some(AutoloadConfig {
+            files: vec!["src/bootstrap.php".into()],
+            ..Default::default()
+        });
+
+        // Dependent listed first — lock order would emit bootstrap before Safe.
+        let lock = ComposerLock {
+            packages: vec![fly, safe],
+            ..Default::default()
+        };
+
+        let manifest: ComposerJson = serde_json::from_value(serde_json::json!({
+            "name": "acme/app",
+            "autoload": { "files": ["app/helpers.php"] }
+        }))
+        .unwrap();
+
+        generate(
+            root,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions::default(),
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(vendor.join("composer/autoload_files.php")).unwrap();
+        let safe_at = body
+            .find("thecodingmachine/safe/generated/filesystem.php")
+            .expect(&body);
+        let fly_at = body
+            .find("rightcapital/flysystem-compress-adapter/src/bootstrap.php")
+            .expect(&body);
+        let root_at = body.find("app/helpers.php").expect(&body);
+        assert!(
+            safe_at < fly_at,
+            "Safe files must load before dependents:\n{body}"
+        );
+        assert!(fly_at < root_at, "root files must load last:\n{body}");
+    }
+
+    #[test]
+    fn package_sorter_puts_transitive_deps_first() {
+        let mut a = locked("acme/a", "1.0.0");
+        a.require.insert("acme/b".into(), "*".into());
+        let mut b = locked("acme/b", "1.0.0");
+        b.require.insert("acme/c".into(), "*".into());
+        let c = locked("acme/c", "1.0.0");
+        let pkgs = [&a, &b, &c];
+        let sorted: Vec<&str> = sort_packages_by_dependency_weight(&pkgs)
+            .into_iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(sorted, vec!["acme/c", "acme/b", "acme/a"]);
+    }
+
+    #[test]
+    fn extract_types_finds_readonly_classes() {
+        let php = r#"<?php
+namespace SebastianBergmann;
+
+final readonly class Version {}
+"#;
+        assert_eq!(
+            extract_types(php),
+            vec!["SebastianBergmann\\Version".to_string()]
+        );
+    }
+
+    #[test]
+    fn classmap_includes_readonly_classmap_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendor = root.join("vendor");
+        let pkg_src = vendor.join("sebastian/version/src");
+        std::fs::create_dir_all(&pkg_src).unwrap();
+        std::fs::write(
+            pkg_src.join("Version.php"),
+            r#"<?php
+namespace SebastianBergmann;
+
+final readonly class Version {}
+"#,
+        )
+        .unwrap();
+
+        let mut pkg = locked("sebastian/version", "5.0.2");
+        pkg.autoload = Some(AutoloadConfig {
+            classmap: vec!["src/".into()],
+            ..Default::default()
+        });
+        let lock = ComposerLock {
+            packages_dev: vec![pkg],
+            ..Default::default()
+        };
+        let manifest: ComposerJson = serde_json::from_value(serde_json::json!({
+            "name": "acme/app"
+        }))
+        .unwrap();
+
+        generate(
+            root,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions::default(),
+        )
+        .unwrap();
+
+        let classmap =
+            std::fs::read_to_string(vendor.join("composer/autoload_classmap.php")).unwrap();
+        assert!(
+            classmap.contains("'SebastianBergmann\\\\Version'"),
+            "readonly classmap package must be indexed:\n{classmap}"
+        );
+    }
+
+    #[test]
+    fn autoload_real_does_not_reinclude_classloader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("composer");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_autoload_real(&dir, false, false).unwrap();
+        let body = std::fs::read_to_string(dir.join("autoload_real.php")).unwrap();
+        assert!(
+            body.contains("class_exists('Composer\\\\Autoload\\\\ClassLoader', false)"),
+            "getLoader must skip ClassLoader.php when already loaded:\n{body}"
+        );
+        assert!(
+            body.contains("require_once __DIR__ . '/ClassLoader.php'"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn requiring_classloader_then_autoload_php_does_not_fatal() {
+        if std::process::Command::new("php")
+            .arg("-v")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendor = root.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let manifest: ComposerJson = serde_json::from_value(serde_json::json!({
+            "name": "acme/app"
+        }))
+        .unwrap();
+        generate(root, &vendor, &manifest, None, &AutoloadOptions::default()).unwrap();
+
+        let status = std::process::Command::new("php")
+            .arg("-d")
+            .arg("display_errors=1")
+            .arg("-r")
+            .arg(format!(
+                "require_once {}; require_once {}; echo 'ok';",
+                php_single_quoted(&vendor.join("composer/ClassLoader.php")),
+                php_single_quoted(&vendor.join("autoload.php")),
+            ))
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "ClassLoader then autoload.php must succeed"
+        );
+    }
+
+    fn php_single_quoted(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', r"\'"))
+    }
+
+    #[test]
+    fn classloader_has_includefile_static_for_interceptors() {
+        if std::process::Command::new("php")
+            .arg("-v")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("composer");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_class_loader(&dir).unwrap();
+        let body = std::fs::read_to_string(dir.join("ClassLoader.php")).unwrap();
+        assert!(
+            body.contains("private static $includeFile"),
+            "official ClassLoader must expose $includeFile"
+        );
+
+        let script = format!(
+            r#"
+            require_once {path};
+            $loader = new Composer\Autoload\ClassLoader();
+            $ok = Closure::bind(static function () {{
+                return self::$includeFile instanceof Closure;
+            }}, null, Composer\Autoload\ClassLoader::class)();
+            echo $ok ? 'ok' : 'missing';
+            "#,
+            path = php_single_quoted(&dir.join("ClassLoader.php")),
+        );
+        let out = std::process::Command::new("php")
+            .arg("-d")
+            .arg("display_errors=1")
+            .arg("-r")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
     }
 }
