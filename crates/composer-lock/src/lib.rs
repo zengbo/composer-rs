@@ -118,6 +118,84 @@ impl ComposerLock {
             .chain(self.packages_dev.iter())
             .find(|p| p.name == name)
     }
+
+    /// Rebuild a lock-shaped document from Composer 1/2 `installed.json`.
+    ///
+    /// Official `dump-autoload` uses this file when `composer.lock` is absent.
+    pub fn load_installed_json(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
+        Self::from_installed_json_str(&text)
+    }
+
+    pub fn from_installed_json_str(text: &str) -> Result<Self> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| Error::Lockfile(e.to_string()))?;
+        let (raw_packages, dev_names) = match value {
+            serde_json::Value::Array(arr) => (arr, Vec::new()),
+            serde_json::Value::Object(obj) => {
+                let pkgs = obj
+                    .get("packages")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let names = obj
+                    .get("dev-package-names")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (pkgs, names)
+            }
+            _ => {
+                return Err(Error::Lockfile(
+                    "installed.json must be an array or a Composer 2 object".into(),
+                ));
+            }
+        };
+
+        let dev: std::collections::BTreeSet<String> = dev_names.into_iter().collect();
+        let mut packages = Vec::new();
+        let mut packages_dev = Vec::new();
+        for (i, raw) in raw_packages.into_iter().enumerate() {
+            let pkg = locked_from_installed_entry(raw)
+                .map_err(|e| Error::Lockfile(format!("installed.json package #{i}: {e}")))?;
+            if dev.contains(&pkg.name) {
+                packages_dev.push(pkg);
+            } else {
+                packages.push(pkg);
+            }
+        }
+
+        Ok(Self {
+            packages,
+            packages_dev,
+            ..Self::default()
+        })
+    }
+}
+
+fn locked_from_installed_entry(mut value: serde_json::Value) -> Result<LockedPackage> {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("version_normalized");
+        obj.remove("install-path");
+        wrap_string_as_array(obj, "license");
+        wrap_string_as_array(obj, "bin");
+        wrap_string_as_array(obj, "keywords");
+    }
+    serde_json::from_value(value).map_err(|e| Error::Lockfile(e.to_string()))
+}
+
+fn wrap_string_as_array(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
+    let Some(val) = obj.get(key) else {
+        return;
+    };
+    if val.is_string() {
+        let s = val.clone();
+        obj.insert(key.to_string(), serde_json::Value::Array(vec![s]));
+    }
 }
 
 /// A locked package entry.
@@ -377,5 +455,35 @@ mod tests {
         let hash = content_hash_from_composer_json(json).unwrap();
         assert_eq!(hash.len(), 32);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn installed_json_splits_dev_packages() {
+        let json = r#"{
+            "packages": [
+                {
+                    "name": "acme/lib",
+                    "version": "1.0.0",
+                    "type": "library",
+                    "license": "MIT",
+                    "install-path": "../acme/lib",
+                    "version_normalized": "1.0.0.0"
+                },
+                {
+                    "name": "phpunit/phpunit",
+                    "version": "10.0.0",
+                    "type": "library"
+                }
+            ],
+            "dev": true,
+            "dev-package-names": ["phpunit/phpunit"]
+        }"#;
+        let lock = ComposerLock::from_installed_json_str(json).unwrap();
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages[0].name, "acme/lib");
+        assert_eq!(lock.packages_dev.len(), 1);
+        assert_eq!(lock.packages_dev[0].name, "phpunit/phpunit");
+        assert_eq!(lock.packages_to_install(false).len(), 1);
+        assert_eq!(lock.packages_to_install(true).len(), 2);
     }
 }

@@ -1,4 +1,4 @@
-//! Shared post-install hooks: bins, scripts, allow-plugins warnings.
+//! Shared post-install hooks: bins, scripts, plugin-skip warnings.
 
 use anyhow::Result;
 use composer_download::install_bins;
@@ -32,25 +32,21 @@ pub fn link_bins(
 }
 
 pub fn warn_unapproved_plugins(lock: &ComposerLock, manifest: &ComposerJson, with_dev: bool) {
-    let allow = manifest.allow_plugins();
-    let allow_all = allow.get("*").copied().unwrap_or(false);
-    let mut unapproved = Vec::new();
-    for pkg in lock.packages_to_install(with_dev) {
-        if pkg.package_type.as_deref() != Some("composer-plugin") {
-            continue;
-        }
-        let ok = allow_all || allow.get(&pkg.name).copied().unwrap_or(false);
-        if !ok {
-            unapproved.push(pkg.name.clone());
-        }
+    let _ = manifest;
+    let plugins: Vec<&str> = lock
+        .packages_to_install(with_dev)
+        .into_iter()
+        .filter(|pkg| pkg.package_type.as_deref() == Some("composer-plugin"))
+        .map(|pkg| pkg.name.as_str())
+        .collect();
+    if plugins.is_empty() {
+        return;
     }
-    if !unapproved.is_empty() {
-        warning(&format!(
-            "composer-plugin package(s) not allowed by config.allow-plugins: {}",
-            unapproved.join(", ")
-        ));
-        warning("Plugins are not executed by composer-rs; grant allow-plugins to silence.");
-    }
+    warning(&format!(
+        "composer-plugin package(s) not executed: {}",
+        plugins.join(", ")
+    ));
+    warning("composer-rs does not run Composer plugins; config.allow-plugins has no effect.");
 }
 
 pub fn run_lifecycle(

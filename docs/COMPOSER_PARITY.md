@@ -89,12 +89,13 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 | `config.bin-dir` | ✅ | ✅ | |
 | PSR-4 / PSR-0 autoload | ✅ | ✅ | |
 | `autoload-dev` | ✅ | ✅ | |
-| Classmap / files autoload | ✅ | ✅ | `files` ordered deps-first (Composer PackageSorter) |
+| Classmap / files autoload | ✅ | ✅ | File-level classmap entries; `files` ordered deps-first (PackageSorter) |
 | `-o` / `--optimize-autoloader` | ✅ | ✅ | |
 | `-a` / `--classmap-authoritative` | ✅ | ✅ | |
 | APCu autoloader prefix | ✅ | ⚠️ | PHP stub exists, no CLI flag |
 | `vendor/autoload.php` | ✅ | ✅ | Ships Composer’s ClassLoader (incl. `$includeFile`) |
 | `installed.json` / `installed.php` | ✅ | ✅ | Composer 2 shape + version_normalized + install-path |
+| `InstalledVersions.php` | ✅ | ✅ | Official Composer runtime class |
 | `platform_check.php` | ✅ | ✅ | |
 
 ---
@@ -112,7 +113,7 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 | Script `@references` | ✅ | ✅ | Cycle detection |
 | PHP `@callable` scripts | ✅ | ✅ | `Class::method` via `php` + Event stub (`vendor-dir`, IO, `isDevMode`) |
 | `composer-plugin` packages | ✅ | ❌ | See [ADR 0001](adr/0001-plugin-execution.md) |
-| `config.allow-plugins` | ✅ | ⚠️ | Parsed; unapproved plugins warn |
+| `config.allow-plugins` | ✅ | ⚠️ | Parsed; plugins are never executed |
 | Symfony Flex / recipes | ✅ | ❌ | Plugin-dependent |
 
 ---
@@ -127,7 +128,7 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 | `remove` | ✅ | ✅ | — |
 | `init` | ✅ | ✅ | — |
 | `validate` | ✅ | ✅ | Constraints + lock hash + `--strict` |
-| `dump-autoload` | ✅ | ✅ | — |
+| `dump-autoload` | ✅ | ✅ | Falls back to `installed.json` if lock is missing |
 | `search` | ✅ | ✅ | Uses project repos + auth.json |
 | `show` | ✅ | ✅ | `--tree`, `--direct`, `--path` |
 | `cache` | ✅ | ✅ | clear / info / dir / repo / prune (`gc`; nlink GC; copy-install caveat) |
@@ -156,7 +157,7 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 
 | Feature | Composer | composer-rs | Notes |
 |---------|----------|-------------|-------|
-| `allow-plugins` enforcement | ✅ | ⚠️ | Warnings; plugins not executed |
+| `allow-plugins` enforcement | ✅ | ⚠️ | Warning only; granting it does not run plugins |
 | `composer audit` | ✅ | ✅ | |
 | Zip-slip protection | ✅ | ✅ | `safe_join` on extract |
 | Audit on install (`--audit`) | ✅ | ✅ | |

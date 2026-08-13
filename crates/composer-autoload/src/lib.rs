@@ -110,6 +110,13 @@ pub fn generate(
         }
     }
 
+    // Official Composer always classmaps the dumped runtime class.
+    // Path is relative to vendor/composer (same convention as package files).
+    classmap.insert(
+        "Composer\\InstalledVersions".into(),
+        "../composer/InstalledVersions.php".into(),
+    );
+
     write_autoload_namespaces(&autoload_dir, &psr0)?;
     write_autoload_psr4(&autoload_dir, &psr4)?;
     write_autoload_classmap(&autoload_dir, &classmap)?;
@@ -123,13 +130,14 @@ pub fn generate(
         options.optimize,
     )?;
     write_class_loader(&autoload_dir)?;
+    write_installed_versions(&autoload_dir)?;
     write_autoload_real(
         &autoload_dir,
         options.classmap_authoritative,
         options.optimize,
     )?;
     write_installed(&autoload_dir, lock, options.with_dev)?;
-    write_installed_php(&autoload_dir, lock, options.with_dev)?;
+    write_installed_php(&autoload_dir, manifest, lock, options.with_dev)?;
     write_platform_check(&autoload_dir, manifest, lock)?;
 
     // vendor/autoload.php
@@ -275,26 +283,38 @@ fn resolve_autoload_path(vendor_dir: &Path, rel_from_composer: &str) -> PathBuf 
 }
 
 fn scan_classmap(
-    dir: &Path,
+    path: &Path,
     vendor_dir: &Path,
     classmap: &mut BTreeMap<String, String>,
 ) -> Result<()> {
-    if !dir.is_dir() {
+    // Composer classmap entries may be a directory or a single .php file
+    // (e.g. thecodingmachine/safe lists lib/DateTime.php).
+    if path.is_file() {
+        return index_php_file(path, vendor_dir, classmap);
+    }
+    if !path.is_dir() {
         return Ok(());
     }
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
+    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            index_php_file(entry.path(), vendor_dir, classmap)?;
         }
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("php") {
-            continue;
-        }
-        if let Ok(content) = fs::read_to_string(path) {
-            for class in extract_types(&content) {
-                let rel = path_relative_to_composer(path, vendor_dir);
-                classmap.insert(class, rel);
-            }
+    }
+    Ok(())
+}
+
+fn index_php_file(
+    path: &Path,
+    vendor_dir: &Path,
+    classmap: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if path.extension().and_then(|e| e.to_str()) != Some("php") {
+        return Ok(());
+    }
+    if let Ok(content) = fs::read_to_string(path) {
+        let rel = path_relative_to_composer(path, vendor_dir);
+        for class in extract_types(&content) {
+            classmap.insert(class, rel.clone());
         }
     }
     Ok(())
@@ -702,6 +722,17 @@ fn write_class_loader(dir: &Path) -> Result<()> {
     fs::write(&path, BODY).map_err(|e| Error::io(&path, e))
 }
 
+fn write_installed_versions(dir: &Path) -> Result<()> {
+    let path = dir.join("InstalledVersions.php");
+    // Official Composer InstalledVersions (MIT). Projects call
+    // Composer\InstalledVersions without depending on composer/composer.
+    const BODY: &str = include_str!("../php/InstalledVersions.php");
+    if fs::read_to_string(&path).ok().as_deref() == Some(BODY) {
+        return Ok(());
+    }
+    fs::write(&path, BODY).map_err(|e| Error::io(&path, e))
+}
+
 fn write_autoload_real(dir: &Path, classmap_authoritative: bool, optimize: bool) -> Result<()> {
     let path = dir.join("autoload_real.php");
     let authoritative = if classmap_authoritative {
@@ -821,25 +852,65 @@ pub fn installed_packages_json(lock: &ComposerLock, with_dev: bool) -> Vec<serde
         .collect()
 }
 
-fn write_installed_php(dir: &Path, lock: Option<&ComposerLock>, with_dev: bool) -> Result<()> {
+fn write_installed_php(
+    dir: &Path,
+    manifest: &ComposerJson,
+    lock: Option<&ComposerLock>,
+    with_dev: bool,
+) -> Result<()> {
     let path = dir.join("installed.php");
+    let root_name = manifest.name.as_deref().unwrap_or("__root__");
+    let root_pretty = manifest
+        .version
+        .as_deref()
+        .unwrap_or("1.0.0+no-version-set");
+    let root_type = manifest.package_type.as_deref().unwrap_or("library");
     let mut versions = String::from("array(\n");
     if let Some(lock) = lock {
+        let dev_names: BTreeSet<&str> = lock.packages_dev.iter().map(|p| p.name.as_str()).collect();
         for p in lock.packages_to_install(with_dev) {
+            let reference = p
+                .dist
+                .as_ref()
+                .and_then(|d| d.reference.as_deref())
+                .or_else(|| p.source.as_ref().and_then(|s| s.reference.as_deref()));
+            let pkg_type = p.package_type.as_deref().unwrap_or("library");
+            let normalized = composer_core::version_normalized(&p.version);
+            let dev_req = if dev_names.contains(p.name.as_str()) {
+                "true"
+            } else {
+                "false"
+            };
             versions.push_str(&format!(
-                "        '{}' => array('pretty_version' => '{}', 'version' => '{}', 'reference' => null),\n",
-                escape_php(&p.name),
-                escape_php(&p.version),
-                escape_php(&p.version),
+                "        '{name}' => array(\n            'pretty_version' => '{pretty}',\n            'version' => '{version}',\n            'reference' => {reference},\n            'type' => '{ty}',\n            'install_path' => __DIR__ . '/../{name}',\n            'aliases' => array(),\n            'dev_requirement' => {dev_req},\n        ),\n",
+                name = escape_php(&p.name),
+                pretty = escape_php(&p.version),
+                version = escape_php(&normalized),
+                reference = php_optional_string(reference),
+                ty = escape_php(pkg_type),
+                dev_req = dev_req,
             ));
         }
     }
     versions.push_str("    )");
 
     let body = format!(
-        "<?php return array(\n    'root' => array('name' => '__root__'),\n    'versions' => {versions},\n);\n"
+        "<?php return array(\n    'root' => array(\n        'name' => '{root_name}',\n        'pretty_version' => '{root_pretty}',\n        'version' => '{root_norm}',\n        'reference' => null,\n        'type' => '{root_type}',\n        'install_path' => __DIR__ . '/../../',\n        'aliases' => array(),\n        'dev' => {dev},\n    ),\n    'versions' => {versions},\n);\n",
+        root_name = escape_php(root_name),
+        root_pretty = escape_php(root_pretty),
+        root_norm = escape_php(&composer_core::version_normalized(root_pretty)),
+        root_type = escape_php(root_type),
+        dev = if with_dev { "true" } else { "false" },
+        versions = versions,
     );
     fs::write(&path, body).map_err(|e| Error::io(&path, e))
+}
+
+fn php_optional_string(value: Option<&str>) -> String {
+    match value {
+        Some(s) => format!("'{}'", escape_php(s)),
+        None => "null".into(),
+    }
 }
 
 fn write_platform_check(
@@ -1235,6 +1306,134 @@ final readonly class Version {}
             classmap.contains("'SebastianBergmann\\\\Version'"),
             "readonly classmap package must be indexed:\n{classmap}"
         );
+    }
+
+    #[test]
+    fn classmap_indexes_single_php_file_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendor = root.join("vendor");
+        let pkg = vendor.join("thecodingmachine/safe/lib");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("DateTimeImmutable.php"),
+            r#"<?php
+namespace Safe;
+
+class DateTimeImmutable extends \DateTimeImmutable {}
+"#,
+        )
+        .unwrap();
+
+        let mut locked_pkg = locked("thecodingmachine/safe", "2.5.0");
+        locked_pkg.autoload = Some(AutoloadConfig {
+            classmap: vec!["lib/DateTimeImmutable.php".into()],
+            ..Default::default()
+        });
+        let lock = ComposerLock {
+            packages: vec![locked_pkg],
+            ..Default::default()
+        };
+        let manifest: ComposerJson = serde_json::from_value(serde_json::json!({
+            "name": "acme/app"
+        }))
+        .unwrap();
+
+        generate(
+            root,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions::default(),
+        )
+        .unwrap();
+
+        let classmap =
+            std::fs::read_to_string(vendor.join("composer/autoload_classmap.php")).unwrap();
+        assert!(
+            classmap.contains("'Safe\\\\DateTimeImmutable'"),
+            "file-level classmap entry must be indexed:\n{classmap}"
+        );
+        assert!(
+            classmap.contains("thecodingmachine/safe/lib/DateTimeImmutable.php"),
+            "{classmap}"
+        );
+    }
+
+    #[test]
+    fn writes_installed_versions_runtime_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendor = root.join("vendor");
+        std::fs::create_dir_all(vendor.join("acme/lib")).unwrap();
+        let mut pkg = locked("acme/lib", "1.2.3");
+        pkg.dist.as_mut().unwrap().reference = Some("deadbeef".into());
+        let lock = ComposerLock {
+            packages: vec![pkg],
+            ..Default::default()
+        };
+        let manifest: ComposerJson = serde_json::from_value(serde_json::json!({
+            "name": "acme/app"
+        }))
+        .unwrap();
+        generate(
+            root,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions::default(),
+        )
+        .unwrap();
+
+        let dumped = vendor.join("composer/InstalledVersions.php");
+        assert!(dumped.is_file(), "InstalledVersions.php must be written");
+        let body = std::fs::read_to_string(&dumped).unwrap();
+        assert!(body.contains("class InstalledVersions"));
+        assert!(body.contains("namespace Composer;"));
+
+        let classmap =
+            std::fs::read_to_string(vendor.join("composer/autoload_classmap.php")).unwrap();
+        assert!(
+            classmap.contains("'Composer\\\\InstalledVersions'"),
+            "{classmap}"
+        );
+        assert!(
+            classmap.contains("$vendorDir . '/composer/InstalledVersions.php'"),
+            "{classmap}"
+        );
+
+        let installed_php = std::fs::read_to_string(vendor.join("composer/installed.php")).unwrap();
+        assert!(installed_php.contains("'acme/lib'"));
+        assert!(installed_php.contains("'pretty_version' => '1.2.3'"));
+        assert!(installed_php.contains("'dev_requirement' => false"));
+
+        if std::process::Command::new("php")
+            .arg("-v")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let script = format!(
+            "require {autoload}; echo \\Composer\\InstalledVersions::isInstalled('acme/lib') ? 'yes' : 'no';",
+            autoload = php_single_quoted(&vendor.join("autoload.php")),
+        );
+        let out = std::process::Command::new("php")
+            .arg("-d")
+            .arg("display_errors=1")
+            .arg("-r")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "status={:?} stdout={} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "yes");
     }
 
     #[test]

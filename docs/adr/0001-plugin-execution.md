@@ -12,7 +12,7 @@ Composer plugins (`type: composer-plugin`) and Symfony Flex recipes require a PH
 
 composer-rs uses a **hybrid** approach:
 
-1. **Native path (default):** install packages, generate autoload, run shell/`@php`/`Class::method` scripts, link bins, enforce `allow-plugins` as **warnings only**. Do not load or execute Composer plugins.
+1. **Native path (default):** install packages, generate autoload, run shell/`@php`/`Class::method` scripts, link bins. Do not load or execute Composer plugins. Warn when `composer-plugin` packages are present (`config.allow-plugins` does not enable them).
 2. **Documented escape hatch:** for plugin-heavy projects, run official Composer for install/update when plugins are required:
    ```bash
    composer install   # plugins / Flex
@@ -33,7 +33,7 @@ composer-rs uses a **hybrid** approach:
 
 - WordPress/Drupal-style package types get default install paths without plugins.
 - Flex recipes still need official Composer (or manual recipes).
-- `config.allow-plugins` is parsed and unapproved plugins produce clear warnings.
+- `config.allow-plugins` is parsed for `config` / `composer.json` fidelity, but granting it does not execute plugins.
 
 ## Symfony Flex (concrete hybrid)
 

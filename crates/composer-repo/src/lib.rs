@@ -482,214 +482,160 @@ pub struct SearchResult {
     pub favers: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct P2Response {
-    packages: BTreeMap<String, Vec<P2Package>>,
-}
-
-/// Packagist p2 may emit `"__unset"` for inherited fields that were cleared.
-fn deserialize_string_map<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut out = BTreeMap::new();
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    out.insert(k, s.to_string());
-                }
-            }
-            Ok(out)
-        }
-        // "__unset" or null or other → empty
-        _ => Ok(BTreeMap::new()),
-    }
-}
-
-fn deserialize_optional_autoload<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<AutoloadConfig>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Object(_) => serde_json::from_value(value)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        _ => Ok(None), // "__unset", null, etc.
-    }
-}
-
-fn deserialize_optional_dist<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<P2Dist>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Object(_) => serde_json::from_value(value)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        _ => Ok(None),
-    }
-}
-
-fn deserialize_optional_source<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<P2Source>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Object(_) => serde_json::from_value(value)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        _ => Ok(None),
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct P2Package {
-    version: String,
-    #[serde(default, rename = "version_normalized")]
-    version_normalized: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_dist")]
-    dist: Option<P2Dist>,
-    #[serde(default, deserialize_with = "deserialize_optional_source")]
-    source: Option<P2Source>,
-    #[serde(default, deserialize_with = "deserialize_string_map")]
-    require: BTreeMap<String, String>,
-    #[serde(
-        default,
-        rename = "require-dev",
-        deserialize_with = "deserialize_string_map"
-    )]
-    require_dev: BTreeMap<String, String>,
-    #[serde(default, rename = "type")]
-    package_type: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_autoload")]
-    autoload: Option<AutoloadConfig>,
-    #[serde(
-        default,
-        rename = "autoload-dev",
-        deserialize_with = "deserialize_optional_autoload"
-    )]
-    autoload_dev: Option<AutoloadConfig>,
-    #[serde(default, deserialize_with = "deserialize_string_map")]
-    provide: BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "deserialize_string_map")]
-    replace: BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "deserialize_string_map")]
-    conflict: BTreeMap<String, String>,
-    #[serde(default)]
-    bin: serde_json::Value,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    license: serde_json::Value,
-    #[serde(default)]
-    abandoned: Option<serde_json::Value>,
-    #[serde(default)]
-    time: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct P2Dist {
-    #[serde(rename = "type")]
-    dist_type: String,
-    url: String,
-    #[serde(default)]
-    reference: Option<String>,
-    #[serde(default)]
-    shasum: Option<String>,
-    /// Composer failover list: strings or `{ "url": "..." }` objects.
-    #[serde(default)]
-    mirrors: Option<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct P2Source {
-    #[serde(rename = "type")]
-    source_type: String,
-    url: String,
-    #[serde(default)]
-    reference: Option<String>,
-}
-
 fn parse_p2_response(package: &str, body: &[u8]) -> Result<Vec<RemotePackageVersion>> {
-    let parsed: P2Response =
+    let parsed: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| Error::other(format!("p2 parse: {e}")))?;
-
-    let list = parsed
-        .packages
-        .get(package)
-        .or_else(|| parsed.packages.values().next())
+    let packages = parsed
+        .get("packages")
+        .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
 
-    let mut versions = Vec::with_capacity(list.len());
-    for p in list {
-        let version = match ComposerVersion::parse(&p.version) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let bin = match p.bin {
-            serde_json::Value::String(s) => vec![s],
-            serde_json::Value::Array(arr) => arr
-                .into_iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-            _ => vec![],
-        };
-        let license = match p.license {
-            serde_json::Value::String(s) => vec![s],
-            serde_json::Value::Array(arr) => arr
-                .into_iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-            _ => vec![],
-        };
+    let list = packages
+        .get(package)
+        .cloned()
+        .or_else(|| packages.values().next().cloned())
+        .unwrap_or(serde_json::Value::Array(vec![]));
 
-        versions.push(RemotePackageVersion {
-            name: package.to_string(),
-            version,
-            version_normalized: p.version_normalized.unwrap_or_default(),
-            dist: p.dist.map(|d| DistInfo {
-                dist_type: d.dist_type,
-                url: d.url,
-                reference: d.reference,
-                shasum: d.shasum,
-                mirrors: d.mirrors,
-            }),
-            source: p.source.map(|s| SourceInfo {
-                source_type: s.source_type,
-                url: s.url,
-                reference: s.reference,
-            }),
-            require: p.require,
-            require_dev: p.require_dev,
-            package_type: p.package_type,
-            autoload: p.autoload,
-            autoload_dev: p.autoload_dev,
-            provide: p.provide,
-            replace: p.replace,
-            conflict: p.conflict,
-            bin,
-            description: p.description,
-            license,
-            abandoned: p.abandoned,
-            time: p.time,
-        });
+    // Composer v2 p2 is an array of version objects. Some hosts (GitLab /
+    // Satis variants) emit a version-keyed object instead.
+    let items = match list {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .map(|(ver, mut v)| {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.entry("version")
+                        .or_insert(serde_json::Value::String(ver));
+                }
+                v
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let mut versions = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(v) = remote_version_from_p2(package, &item) {
+            versions.push(v);
+        }
     }
-
     Ok(versions)
+}
+
+/// GitLab / Satis sometimes emit a JSON array where Composer documents a
+/// string (`description`, `dist.url`, …). Take the first scalar rather than
+/// failing the whole p2 document.
+fn json_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) if s != "__unset" => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Array(arr) => arr.iter().find_map(json_string),
+        _ => None,
+    }
+}
+
+fn json_string_map(value: &serde_json::Value) -> BTreeMap<String, String> {
+    let Some(obj) = value.as_object() else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for (k, v) in obj {
+        if let Some(s) = json_string(v) {
+            out.insert(k.clone(), s);
+        }
+    }
+    out
+}
+
+fn json_string_list(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(arr) => arr.iter().filter_map(json_string).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn json_object<'a>(
+    value: &'a serde_json::Value,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    value.as_object()
+}
+
+fn parse_p2_dist(value: &serde_json::Value) -> Option<DistInfo> {
+    let obj = json_object(value)?;
+    let dist_type = obj.get("type").and_then(json_string)?;
+    let (url, extra_mirrors) = match obj.get("url") {
+        Some(serde_json::Value::Array(arr)) if !arr.is_empty() => {
+            let url = json_string(&arr[0])?;
+            let rest = arr[1..].iter().cloned().collect::<Vec<_>>();
+            (url, rest)
+        }
+        Some(v) => (json_string(v)?, Vec::new()),
+        None => return None,
+    };
+    let mut mirrors = match obj.get("mirrors") {
+        Some(serde_json::Value::Array(arr)) => Some(arr.clone()),
+        Some(other) => Some(vec![other.clone()]),
+        None => None,
+    };
+    if !extra_mirrors.is_empty() {
+        mirrors.get_or_insert_with(Vec::new).extend(extra_mirrors);
+    }
+    Some(DistInfo {
+        dist_type,
+        url,
+        reference: obj.get("reference").and_then(json_string),
+        shasum: obj.get("shasum").and_then(json_string),
+        mirrors,
+    })
+}
+
+fn parse_p2_source(value: &serde_json::Value) -> Option<SourceInfo> {
+    let obj = json_object(value)?;
+    Some(SourceInfo {
+        source_type: obj.get("type").and_then(json_string)?,
+        url: obj.get("url").and_then(json_string)?,
+        reference: obj.get("reference").and_then(json_string),
+    })
+}
+
+fn parse_p2_autoload(value: &serde_json::Value) -> Option<AutoloadConfig> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn remote_version_from_p2(package: &str, item: &serde_json::Value) -> Option<RemotePackageVersion> {
+    let obj = json_object(item)?;
+    let raw_version = obj.get("version").and_then(json_string)?;
+    let version = ComposerVersion::parse(&raw_version).ok()?;
+    let version_normalized = obj
+        .get("version_normalized")
+        .and_then(json_string)
+        .unwrap_or_default();
+    Some(RemotePackageVersion {
+        name: package.to_string(),
+        version,
+        version_normalized,
+        dist: obj.get("dist").and_then(parse_p2_dist),
+        source: obj.get("source").and_then(parse_p2_source),
+        require: obj.get("require").map(json_string_map).unwrap_or_default(),
+        require_dev: obj
+            .get("require-dev")
+            .map(json_string_map)
+            .unwrap_or_default(),
+        package_type: obj.get("type").and_then(json_string),
+        autoload: obj.get("autoload").and_then(parse_p2_autoload),
+        autoload_dev: obj.get("autoload-dev").and_then(parse_p2_autoload),
+        provide: obj.get("provide").map(json_string_map).unwrap_or_default(),
+        replace: obj.get("replace").map(json_string_map).unwrap_or_default(),
+        conflict: obj.get("conflict").map(json_string_map).unwrap_or_default(),
+        bin: obj.get("bin").map(json_string_list).unwrap_or_default(),
+        description: obj.get("description").and_then(json_string),
+        license: obj.get("license").map(json_string_list).unwrap_or_default(),
+        abandoned: obj.get("abandoned").cloned(),
+        time: obj.get("time").and_then(json_string),
+    })
 }
 
 #[cfg(test)]
@@ -755,5 +701,48 @@ mod tests {
         );
         let locked = versions[0].to_locked();
         assert_eq!(locked.dist.as_ref().unwrap().mirrors, dist.mirrors);
+    }
+
+    #[test]
+    fn parse_p2_accepts_array_scalars_used_by_gitlab() {
+        let sample = r#"{
+            "packages": {
+                "acme/lib": [
+                    {
+                        "version": "1.0.0",
+                        "description": ["line one", "line two"],
+                        "type": ["library"],
+                        "time": ["2024-01-01T00:00:00+00:00"],
+                        "dist": {
+                            "type": "zip",
+                            "url": [
+                                "https://gitlab.example/a.zip",
+                                "https://gitlab.example/b.zip"
+                            ],
+                            "reference": ["abc"]
+                        },
+                        "require": { "php": [">=8.1"] },
+                        "autoload": {
+                            "classmap": "src/Foo.php",
+                            "psr-4": { "Acme\\": ["src/", "lib/"] }
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let versions = parse_p2_response("acme/lib", sample.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].description.as_deref(), Some("line one"));
+        assert_eq!(versions[0].package_type.as_deref(), Some("library"));
+        let dist = versions[0].dist.as_ref().expect("dist");
+        assert_eq!(dist.url, "https://gitlab.example/a.zip");
+        assert_eq!(dist.reference.as_deref(), Some("abc"));
+        assert_eq!(
+            versions[0].require.get("php").map(String::as_str),
+            Some(">=8.1")
+        );
+        let al = versions[0].autoload.as_ref().expect("autoload");
+        assert_eq!(al.classmap, vec!["src/Foo.php"]);
+        assert_eq!(al.psr4.get("Acme\\").unwrap().paths(), vec!["src/", "lib/"]);
     }
 }

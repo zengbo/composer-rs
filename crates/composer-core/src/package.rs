@@ -97,14 +97,45 @@ pub struct AutoloadConfig {
     #[serde(rename = "psr-0", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub psr0: BTreeMap<String, PathOrPaths>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub classmap: Vec<String>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub files: Vec<String>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub exclude_from_classmap: Vec<String>,
+}
+
+/// Composer sometimes emits a single string where the schema says array.
+fn deserialize_string_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// A single path or list of paths (Composer allows both).
@@ -148,5 +179,16 @@ mod tests {
     fn vendor_packages_are_not_platform() {
         assert!(!PackageId::parse("phpunit/phpunit").unwrap().is_platform());
         assert!(!PackageId::parse("php/foo").unwrap().is_platform());
+    }
+
+    #[test]
+    fn classmap_accepts_string_or_array() {
+        let al: AutoloadConfig = serde_json::from_value(serde_json::json!({
+            "classmap": "lib/DateTime.php",
+            "files": ["generated.php"]
+        }))
+        .unwrap();
+        assert_eq!(al.classmap, vec!["lib/DateTime.php"]);
+        assert_eq!(al.files, vec!["generated.php"]);
     }
 }
