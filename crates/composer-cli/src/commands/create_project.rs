@@ -101,6 +101,7 @@ pub async fn run(args: CreateProjectArgs) -> Result<()> {
     let packages = locked_list(&lock, true);
     let refs: Vec<_> = packages.iter().collect();
     installer.install_all(&refs, &vendor).await?;
+    super::warn_copy_install(installer.stats().snapshot().copies);
 
     let bin_dir = dir_name.join(manifest.bin_dir());
     let _ = install_bins(

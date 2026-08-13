@@ -130,7 +130,7 @@ Comparison of **official Composer** vs **composer-rs**, plus a task breakdown fo
 | `dump-autoload` | ✅ | ✅ | — |
 | `search` | ✅ | ✅ | Uses project repos + auth.json |
 | `show` | ✅ | ✅ | `--tree`, `--direct`, `--path` |
-| `cache` | ✅ | ✅ | clear / info / dir / repo |
+| `cache` | ✅ | ✅ | clear / info / dir / repo / prune (`gc`; nlink GC; copy-install caveat) |
 | `bump` | ✅ | ✅ | |
 | `fund` | ✅ | ✅ | Reads vendor composer.json funding |
 | `exec` | ✅ | ✅ | vendor/bin on PATH |
@@ -230,7 +230,7 @@ Closing remaining gaps after Phases 1–4. Items below are **done** unless marke
 
 - [x] **5.6** `config.platform-check` honored by `platform_check.php`
 - [x] **5.7** `preferred-install` / prefer-dist
-- [x] **5.8** `cache` `{clear,info,dir,repo}`
+- [x] **5.8** `cache` `{clear,info,dir,repo,prune}`
 - [x] **5.9** `create-project` unpacks `type:project` to the target root
 - [x] **5.10** `update --lock` refreshes content-hash only
 - [x] **5.11** Solver `conflict` encoding (reachable complement + post-solve check)

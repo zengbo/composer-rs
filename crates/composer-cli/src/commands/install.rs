@@ -1,6 +1,8 @@
 //! `composer-rs install`
 
-use super::{format_duration, header, info, project_paths, success, vendor_dir, warning};
+use super::{
+    format_duration, header, info, project_paths, success, vendor_dir, warn_copy_install, warning,
+};
 use crate::hooks::{link_bins, run_lifecycle, warn_unapproved_plugins};
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -188,6 +190,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         stats.copies,
         composer_cache::format_bytes(stats.bytes),
     ));
+    warn_copy_install(stats.copies);
 
     link_bins(&refs, &vendor, &cwd, &manifest, &installer_paths)?;
 

@@ -90,6 +90,7 @@ pub async fn run(args: ReinstallArgs) -> Result<()> {
         .with_auth(auth);
     let refs: Vec<_> = targets.iter().copied().collect();
     installer.install_all(&refs, &vendor).await?;
+    super::warn_copy_install(installer.stats().snapshot().copies);
 
     link_bins(&refs, &vendor, &cwd, &manifest, &installer_paths)?;
 

@@ -4,6 +4,7 @@
 //! - Packages are stored once under `~/.cache/composer-rs/cas/<shard>/<hash>/`
 //! - Project `vendor/` trees hardlink files from the CAS (copy on cross-FS)
 //! - Multiple git worktrees share the same physical package bytes
+//! - `prune_unreferenced` drops CAS trees whose files have no vendor hardlinks
 
 #![deny(unsafe_code)]
 
@@ -216,6 +217,76 @@ impl CasCache {
         Ok(count)
     }
 
+    /// Drop CAS trees that no vendor hardlinks to.
+    ///
+    /// A complete package is live if any regular file (other than the
+    /// `.composer-rs-complete` marker) has `nlink > 1`. That is the install
+    /// path: `link_to` hardlinks vendor files onto the CAS inodes.
+    ///
+    /// Incomplete / `.staging` leftovers are always candidates. Archives and
+    /// metadata are left alone. On non-Unix, hardlink nlink is not available,
+    /// so complete packages are kept.
+    ///
+    /// If vendor was populated with `copy` (hardlink failed, usually
+    /// cross-filesystem), CAS files stay at `nlink == 1` and this will treat
+    /// them as orphans. The vendor copies remain valid.
+    ///
+    /// `dry_run` reports the same counts without deleting.
+    pub fn prune_unreferenced(&self, dry_run: bool) -> Result<PruneStats> {
+        let mut stats = PruneStats::default();
+        if !self.cas_root.exists() {
+            return Ok(stats);
+        }
+
+        let shards: Vec<PathBuf> = fs::read_dir(&self.cas_root)
+            .map_err(|e| Error::io(&self.cas_root, e))?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| Error::io(&self.cas_root, e))?;
+
+        for shard_path in shards {
+            if !shard_path.is_dir() {
+                continue;
+            }
+            self.prune_shard(&shard_path, dry_run, &mut stats)?;
+            if !dry_run {
+                remove_dir_if_empty(&shard_path);
+            }
+        }
+        Ok(stats)
+    }
+
+    fn prune_shard(&self, shard_path: &Path, dry_run: bool, stats: &mut PruneStats) -> Result<()> {
+        let entries: Vec<PathBuf> = fs::read_dir(shard_path)
+            .map_err(|e| Error::io(shard_path, e))?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| Error::io(shard_path, e))?;
+
+        for path in entries {
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let complete = path.join(".composer-rs-complete").is_file();
+            if name.ends_with(".staging") || !complete {
+                stats.leftover_removed += 1;
+                drop_cas_tree(&path, dry_run, stats)?;
+                continue;
+            }
+
+            stats.complete_scanned += 1;
+            if package_has_vendor_hardlink(&path) {
+                stats.complete_kept += 1;
+                continue;
+            }
+            if !remove_unreferenced_complete(&path, dry_run, stats)? {
+                stats.complete_kept += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Remove entire cache root and return bytes freed.
     pub fn clear_all() -> Result<u64> {
         let root = cache_root();
@@ -225,6 +296,27 @@ impl CasCache {
         let size = dir_size(&root);
         fs::remove_dir_all(&root).map_err(|e| Error::io(&root, e))?;
         Ok(size)
+    }
+}
+
+/// Result of [`CasCache::prune_unreferenced`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Complete CAS packages examined.
+    pub complete_scanned: usize,
+    /// Complete packages still hardlinked from a vendor.
+    pub complete_kept: usize,
+    /// Complete packages deleted (or counted, when dry-run).
+    pub complete_removed: usize,
+    /// Incomplete / staging trees deleted (or counted, when dry-run).
+    pub leftover_removed: usize,
+    /// Bytes that were (or would be) freed.
+    pub bytes_freed: u64,
+}
+
+impl PruneStats {
+    pub fn removed(&self) -> usize {
+        self.complete_removed + self.leftover_removed
     }
 }
 
@@ -347,6 +439,84 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
+/// True when any CAS file inode is also linked from outside this tree.
+///
+/// Unreadable entries are treated as live (do not GC). On non-Unix we cannot
+/// read `nlink`, so complete packages are treated as live.
+fn package_has_vendor_hardlink(path: &Path) -> bool {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for entry in WalkDir::new(path) {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if entry.file_name() == ".composer-rs-complete" {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                return true;
+            };
+            if meta.nlink() > 1 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn drop_cas_tree(path: &Path, dry_run: bool, stats: &mut PruneStats) -> Result<()> {
+    let size = dir_size(path);
+    if !dry_run {
+        fs::remove_dir_all(path).map_err(|e| Error::io(path, e))?;
+    }
+    stats.bytes_freed += size;
+    Ok(())
+}
+
+/// Delete an unreferenced complete package. Returns `false` if a vendor
+/// hardlink appeared after the marker was dropped (package is kept).
+fn remove_unreferenced_complete(
+    path: &Path,
+    dry_run: bool,
+    stats: &mut PruneStats,
+) -> Result<bool> {
+    if dry_run {
+        stats.complete_removed += 1;
+        stats.bytes_freed += dir_size(path);
+        return Ok(true);
+    }
+
+    let marker = path.join(".composer-rs-complete");
+    let key = fs::read(&marker).map_err(|e| Error::io(&marker, e))?;
+    fs::remove_file(&marker).map_err(|e| Error::io(&marker, e))?;
+
+    if package_has_vendor_hardlink(path) {
+        fs::write(&marker, key).map_err(|e| Error::io(&marker, e))?;
+        return Ok(false);
+    }
+
+    stats.complete_removed += 1;
+    drop_cas_tree(path, false, stats)?;
+    Ok(true)
+}
+
+fn remove_dir_if_empty(path: &Path) {
+    if let Ok(mut entries) = fs::read_dir(path) {
+        if entries.next().is_none() {
+            let _ = fs::remove_dir(path);
+        }
+    }
+}
+
 /// Format byte count for display.
 pub fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
@@ -401,5 +571,114 @@ mod tests {
             assert_eq!(ino1, cas_ino);
             assert_eq!(ino2, cas_ino);
         }
+    }
+
+    fn write_pkg(dir: &Path, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let mut f = fs::File::create(dir.join("hello.txt")).unwrap();
+        writeln!(f, "{body}").unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_drops_unlinked_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = CasCache::with_root(tmp.path().join("cas"));
+        let pkg = tmp.path().join("pkg");
+        write_pkg(&pkg, "orphan");
+        cas.store("orphan-key", &pkg).unwrap();
+        assert_eq!(cas.package_count().unwrap(), 1);
+
+        let dry = cas.prune_unreferenced(true).unwrap();
+        assert_eq!(dry.complete_scanned, 1);
+        assert_eq!(dry.complete_removed, 1);
+        assert_eq!(dry.complete_kept, 0);
+        assert!(dry.bytes_freed > 0);
+        assert_eq!(cas.package_count().unwrap(), 1);
+
+        let gone = cas.prune_unreferenced(false).unwrap();
+        assert_eq!(gone.complete_removed, 1);
+        assert_eq!(cas.package_count().unwrap(), 0);
+        assert!(!cas.contains("orphan-key"));
+    }
+
+    #[test]
+    fn prune_keeps_hardlinked_vendor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = CasCache::with_root(tmp.path().join("cas"));
+        let pkg = tmp.path().join("pkg");
+        write_pkg(&pkg, "live");
+        cas.store("live-key", &pkg).unwrap();
+        let vendor = tmp.path().join("vendor/foo/bar");
+        cas.link_to("live-key", &vendor).unwrap();
+
+        let stats = cas.prune_unreferenced(false).unwrap();
+        assert_eq!(stats.complete_scanned, 1);
+        assert_eq!(stats.complete_kept, 1);
+        assert_eq!(stats.complete_removed, 0);
+        assert!(cas.contains("live-key"));
+        assert!(vendor.join("hello.txt").is_file());
+    }
+
+    #[test]
+    fn prune_keeps_if_any_vendor_remains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = CasCache::with_root(tmp.path().join("cas"));
+        let pkg = tmp.path().join("pkg");
+        write_pkg(&pkg, "shared");
+        cas.store("shared-key", &pkg).unwrap();
+        let vendor_a = tmp.path().join("a/vendor/foo/bar");
+        let vendor_b = tmp.path().join("b/vendor/foo/bar");
+        cas.link_to("shared-key", &vendor_a).unwrap();
+        cas.link_to("shared-key", &vendor_b).unwrap();
+        fs::remove_dir_all(&vendor_a).unwrap();
+
+        let stats = cas.prune_unreferenced(false).unwrap();
+        assert_eq!(stats.complete_kept, 1);
+        assert_eq!(stats.complete_removed, 0);
+        assert!(cas.contains("shared-key"));
+        assert!(vendor_b.join("hello.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_drops_after_last_vendor_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = CasCache::with_root(tmp.path().join("cas"));
+        let pkg = tmp.path().join("pkg");
+        write_pkg(&pkg, "gone");
+        cas.store("gone-key", &pkg).unwrap();
+        let vendor = tmp.path().join("vendor/foo/bar");
+        cas.link_to("gone-key", &vendor).unwrap();
+        fs::remove_dir_all(&vendor).unwrap();
+
+        let stats = cas.prune_unreferenced(false).unwrap();
+        assert_eq!(stats.complete_removed, 1);
+        assert_eq!(cas.package_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_drops_staging_and_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let cas = CasCache::with_root(&cas_root);
+        let pkg = tmp.path().join("pkg");
+        write_pkg(&pkg, "ok");
+        cas.store("keep-key", &pkg).unwrap();
+        cas.link_to("keep-key", &tmp.path().join("vendor/keep"))
+            .unwrap();
+
+        let shard = cas_root.join("zz");
+        let staging = shard.join("dead.staging");
+        write_pkg(&staging.join("src"), "staging");
+        let incomplete = shard.join("incompletehash");
+        write_pkg(&incomplete, "no-marker");
+
+        let stats = cas.prune_unreferenced(false).unwrap();
+        assert_eq!(stats.complete_kept, 1);
+        assert_eq!(stats.leftover_removed, 2);
+        assert!(!staging.exists());
+        assert!(!incomplete.exists());
+        assert!(cas.contains("keep-key"));
     }
 }

@@ -216,6 +216,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         "cache hits: {}  downloads: {}  skipped: {}  hardlinks: {}  copies: {}",
         stats.cache_hits, stats.downloaded, stats.skipped, stats.hardlinks, stats.copies,
     ));
+    super::warn_copy_install(stats.copies);
 
     link_bins(&refs, &vendor, &cwd, &manifest, &installer_paths)?;
 

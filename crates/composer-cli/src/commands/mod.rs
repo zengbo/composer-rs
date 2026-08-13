@@ -55,6 +55,16 @@ pub fn warning(msg: &str) {
     println!("{} {}", style("!").yellow().bold(), msg);
 }
 
+/// Cross-FS copy fallback breaks `cache prune` nlink detection.
+pub fn warn_copy_install(copies: u64) {
+    if copies == 0 {
+        return;
+    }
+    warning(&format!(
+        "install used {copies} copies (hardlink failed, usually cross-filesystem) — `cache prune` cannot see those vendor files and may drop the CAS copy; vendor stays intact, warm cache for those files is lost"
+    ));
+}
+
 pub fn format_duration(d: Duration) -> String {
     if d.as_secs() >= 60 {
         format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)

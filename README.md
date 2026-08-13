@@ -33,6 +33,10 @@ Inspired by [libretto](https://github.com/libretto-pm/libretto) and the storage 
 
 On install, files are **hardlinked** from CAS into `vendor/vendor/name/`. A second worktree paying for `symfony/console` costs almost no extra disk.
 
+`composer-rs cache prune` (alias: `gc`) deletes CAS trees whose files have `nlink == 1` — nothing in any `vendor/` still points at them. It does not scan worktree paths and does not touch `archives/` or `metadata/`. After every worktree that used a package has dropped its `vendor/` copy, prune reclaims that CAS entry.
+
+If install reports `copies > 0` (hardlink failed, usually a different filesystem / APFS volume), prune may reclaim those CAS trees early. `vendor/` is unaffected, but the warm cache for those files is gone.
+
 Override cache location with `COMPOSER_RS_CACHE`.
 
 ## Install
@@ -95,7 +99,9 @@ composer-rs global require phpunit/phpunit
 
 # Cache
 composer-rs cache info
-composer-rs cache clear
+composer-rs cache prune          # drop CAS packages with no vendor hardlinks (alias: gc)
+composer-rs cache prune --dry-run
+composer-rs cache clear          # wipe CAS + archives + metadata
 ```
 
 ### Useful flags

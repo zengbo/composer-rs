@@ -16,6 +16,13 @@ pub enum CacheCommands {
     Dir,
     /// Show repository metadata cache path / size
     Repo,
+    /// Delete CAS packages not hardlinked from any vendor
+    #[command(visible_alias = "gc")]
+    Prune {
+        /// List unreferenced packages without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run(cmd: CacheCommands) -> Result<()> {
@@ -35,6 +42,14 @@ pub fn run(cmd: CacheCommands) -> Result<()> {
             info(&format!("metadata : {}", metadata_dir().display()));
             info(&format!("packages : {}", cas.package_count()?));
             info(&format!("size     : {}", format_bytes(cas.size_bytes())));
+            let estimate = cas.prune_unreferenced(true)?;
+            info(&format!(
+                "unref.   : {} package(s) · {} (estimate)",
+                estimate.removed(),
+                format_bytes(estimate.bytes_freed)
+            ));
+            #[cfg(not(unix))]
+            super::warning("complete packages are not pruned on this platform");
             success("done");
         }
         CacheCommands::Dir => {
@@ -53,6 +68,42 @@ pub fn run(cmd: CacheCommands) -> Result<()> {
                 info("files: 0 (not created yet)");
             }
             success("done");
+        }
+        CacheCommands::Prune { dry_run } => {
+            header(if dry_run {
+                "Pruning unreferenced CAS (dry run)"
+            } else {
+                "Pruning unreferenced CAS"
+            });
+            let cas = CasCache::new();
+            let stats = cas.prune_unreferenced(dry_run)?;
+            let removed_label = if dry_run { "would remove" } else { "removed" };
+            info(&format!(
+                "complete : {} scanned  ·  {} in use  ·  {} {removed_label}",
+                stats.complete_scanned, stats.complete_kept, stats.complete_removed
+            ));
+            if stats.leftover_removed > 0 {
+                info(&format!(
+                    "leftover : {} incomplete/staging",
+                    stats.leftover_removed
+                ));
+            }
+            info("archives : left in place");
+            #[cfg(not(unix))]
+            super::warning("complete packages are not pruned on this platform");
+            if dry_run {
+                success(&format!(
+                    "Dry run — would free {} ({} package tree(s))",
+                    format_bytes(stats.bytes_freed),
+                    stats.removed()
+                ));
+            } else {
+                success(&format!(
+                    "Pruned {} ({} package tree(s))",
+                    format_bytes(stats.bytes_freed),
+                    stats.removed()
+                ));
+            }
         }
     }
     Ok(())
