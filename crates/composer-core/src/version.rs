@@ -251,18 +251,11 @@ impl VersionConstraint {
                 .any(|part| VersionConstraint::new(part.trim()).matches(version));
         }
 
-        // AND: space or comma separated clauses
-        let clauses: Vec<&str> = if s.contains(',') {
-            s.split(',')
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .collect()
-        } else {
-            // split on whitespace but keep operators attached
-            split_and_clauses(s)
-        };
-
-        clauses.iter().all(|c| match_single(c, version))
+        // AND: comma and/or whitespace. Composer allows a space after operators
+        // (`>= 7.1`); those must stay one clause, not `>=` AND `7.1`.
+        split_constraint_and_clauses(s)
+            .iter()
+            .all(|c| match_single(c, version))
     }
 }
 
@@ -285,33 +278,51 @@ impl FromStr for VersionConstraint {
     }
 }
 
-fn split_and_clauses(s: &str) -> Vec<&str> {
-    // ">=1.0 <2.0" or "^1.0"
+fn is_constraint_operator(tok: &str) -> bool {
+    matches!(
+        tok,
+        ">=" | "<=" | "!=" | "<>" | ">" | "<" | "=" | "==" | "^" | "~"
+    )
+}
+
+/// Split a Composer AND-constraint into clauses.
+///
+/// Commas always separate clauses. Whitespace also separates **complete**
+/// clauses (`>=1.0 <2.0`), but a lone operator is glued to the next token
+/// so `>= 7.1` and `>= 1.0 < 2.0` stay valid.
+pub(crate) fn split_constraint_and_clauses(s: &str) -> Vec<String> {
+    let mut raw: Vec<&str> = Vec::new();
+    if s.contains(',') {
+        for part in s.split(',') {
+            raw.extend(part.split_whitespace());
+        }
+    } else {
+        raw.extend(s.split_whitespace());
+    }
+
     let mut out = Vec::new();
-    let mut start = 0;
-    let bytes = s.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            if start < i {
-                out.push(s[start..i].trim());
-            }
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            start = i;
-            continue;
+    while i < raw.len() {
+        if is_constraint_operator(raw[i]) && i + 1 < raw.len() {
+            out.push(format!("{}{}", raw[i], raw[i + 1]));
+            i += 2;
+        } else if i + 2 < raw.len()
+            && raw[i + 1] == "-"
+            && !is_constraint_operator(raw[i])
+            && !is_constraint_operator(raw[i + 2])
+        {
+            // Composer hyphen range: `8.1 - 8.5` (spaces around `-` required).
+            out.push(format!("{} - {}", raw[i], raw[i + 2]));
+            i += 3;
+        } else if !raw[i].is_empty() {
+            out.push(raw[i].to_string());
+            i += 1;
+        } else {
+            i += 1;
         }
-        i += 1;
     }
-    if start < s.len() {
-        let t = s[start..].trim();
-        if !t.is_empty() {
-            out.push(t);
-        }
-    }
-    if out.is_empty() {
-        out.push(s);
+    if out.is_empty() && !s.trim().is_empty() {
+        out.push(s.trim().to_string());
     }
     out
 }
@@ -325,6 +336,9 @@ fn match_single(clause: &str, version: &ComposerVersion) -> bool {
     // Stability flag suffix: package@dev — handled at dependency level; ignore here.
     let c = c.split('@').next().unwrap_or(c);
 
+    if let Some((from, to)) = split_hyphen_range(c) {
+        return match_hyphen_range(from, to, version);
+    }
     if let Some(rest) = c.strip_prefix("^") {
         return match_caret(rest, version);
     }
@@ -359,6 +373,77 @@ fn match_single(clause: &str, version: &ComposerVersion) -> bool {
 
 fn parse_ref(s: &str) -> Option<ComposerVersion> {
     ComposerVersion::parse(s.trim().trim_start_matches('v')).ok()
+}
+
+/// Composer hyphen range `from - to` (spaces around `-` required).
+fn split_hyphen_range(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim();
+    let mid = s.find(" - ")?;
+    let from = s[..mid].trim();
+    let to = s[mid + 3..].trim();
+    if from.is_empty() || to.is_empty() {
+        return None;
+    }
+    if from.starts_with(['>', '<', '=', '^', '~', '!']) {
+        return None;
+    }
+    Some((from, to))
+}
+
+/// How many numeric dotted components the spec wrote (`8.5` → 2, `8.5.0` → 3).
+fn numeric_component_count(spec: &str) -> usize {
+    spec.trim()
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .count()
+}
+
+fn version_from_parts(maj: u64, min: u64, pat: u64) -> ComposerVersion {
+    ComposerVersion {
+        raw: format!("{maj}.{min}.{pat}"),
+        normalized: format!("{maj}.{min}.{pat}"),
+        stability: Stability::Stable,
+        parts: (maj, min, pat),
+        pre: None,
+    }
+}
+
+/// Inclusive lower + upper bound. `exclusive` means `< upper`, else `<= upper`.
+///
+/// Composer: partial `to` (`8` / `8.5`) includes that whole branch (`<9` / `<8.6`);
+/// a full `8.5.0` is inclusive (`<=8.5.0`).
+pub(crate) fn hyphen_range_bounds(
+    from: &str,
+    to: &str,
+) -> Option<(ComposerVersion, ComposerVersion, bool)> {
+    let lower = parse_ref(from)?;
+    let to_base = parse_ref(to)?;
+    let (maj, min, _) = to_base.parts;
+    let (upper, exclusive) = match numeric_component_count(to) {
+        1 => (version_from_parts(maj.checked_add(1)?, 0, 0), true),
+        2 => (version_from_parts(maj, min.checked_add(1)?, 0), true),
+        0 => return None,
+        _ => (to_base, false),
+    };
+    Some((lower, upper, exclusive))
+}
+
+fn match_hyphen_range(from: &str, to: &str, version: &ComposerVersion) -> bool {
+    let Some((lower, upper, exclusive)) = hyphen_range_bounds(from, to) else {
+        return false;
+    };
+    if version < &lower {
+        return false;
+    }
+    if exclusive {
+        version < &upper
+    } else {
+        version <= &upper
+    }
 }
 
 fn versions_equal(version: &ComposerVersion, spec: &str) -> bool {
@@ -524,6 +609,54 @@ mod tests {
         let c = VersionConstraint::new(">=1.0 <2.0");
         assert!(c.matches(&v("1.5.0")));
         assert!(!c.matches(&v("2.0.0")));
+    }
+
+    #[test]
+    fn hyphen_range_partial_to_includes_branch() {
+        let c = VersionConstraint::new("8.1 - 8.5");
+        assert!(c.matches(&v("8.1.0")));
+        assert!(c.matches(&v("8.5.0")));
+        assert!(c.matches(&v("8.5.9")));
+        assert!(!c.matches(&v("8.0.99")));
+        assert!(!c.matches(&v("8.6.0")));
+
+        let c = VersionConstraint::new("8.1.0 - 8.5.0");
+        assert!(c.matches(&v("8.5.0")));
+        assert!(!c.matches(&v("8.5.1")));
+
+        let c = VersionConstraint::new("1 - 2");
+        assert!(c.matches(&v("2.9.0")));
+        assert!(!c.matches(&v("3.0.0")));
+
+        assert_eq!(
+            split_constraint_and_clauses("8.1 - 8.5"),
+            vec!["8.1 - 8.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn spaced_comparison_operators() {
+        let c = VersionConstraint::new(">= 7.1");
+        assert!(c.matches(&v("7.1.0")));
+        assert!(c.matches(&v("8.5.9")));
+        assert!(!c.matches(&v("7.0.33")));
+
+        let c = VersionConstraint::new(">= 1.0 < 2.0");
+        assert!(c.matches(&v("1.5.0")));
+        assert!(!c.matches(&v("2.0.0")));
+
+        let c = VersionConstraint::new(">= 7.1, < 8.0");
+        assert!(c.matches(&v("7.4.0")));
+        assert!(!c.matches(&v("8.0.0")));
+
+        assert_eq!(
+            split_constraint_and_clauses(">= 7.1"),
+            vec![">=7.1".to_string()]
+        );
+        assert_eq!(
+            split_constraint_and_clauses(">= 1.0 < 2.0"),
+            vec![">=1.0".to_string(), "<2.0".to_string()]
+        );
     }
 
     #[test]

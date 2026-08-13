@@ -288,8 +288,18 @@ mod tests {
         };
         assert!(platform.satisfies("php", ">=8.1"));
         assert!(!platform.satisfies("php", ">=8.3"));
+        assert!(platform.satisfies("php", ">= 7.1"));
+        assert!(platform.satisfies("php", ">= 8.2"));
+        assert!(platform.satisfies("php", "8.1 - 8.5"));
         assert!(platform.satisfies("ext-json", "*"));
         assert!(!platform.satisfies("ext-missing", "*"));
+    }
+
+    #[test]
+    fn hyphen_php_range_accepts_patch_on_upper_minor() {
+        let platform = Platform::with_php("8.5.9").unwrap();
+        assert!(platform.satisfies("php", "8.1 - 8.5"));
+        assert!(!platform.satisfies("php", "8.1 - 8.4"));
     }
 
     #[test]

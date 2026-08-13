@@ -1,6 +1,9 @@
 //! Convert Composer constraints into pubgrub `Ranges`.
 
-use crate::version::{ComposerVersion, Stability, VersionConstraint};
+use crate::version::{
+    ComposerVersion, Stability, VersionConstraint, hyphen_range_bounds,
+    split_constraint_and_clauses,
+};
 use version_ranges::Ranges;
 
 /// Convert a Composer version constraint into a `Ranges<ComposerVersion>`.
@@ -25,10 +28,10 @@ pub fn constraint_to_ranges(constraint: &VersionConstraint) -> Ranges<ComposerVe
         return acc;
     }
 
-    let clauses = split_and(s);
+    let clauses = split_constraint_and_clauses(s);
     let mut acc = Ranges::full();
     for c in clauses {
-        acc = acc.intersection(&single_to_ranges(c));
+        acc = acc.intersection(&single_to_ranges(&c));
     }
     acc
 }
@@ -38,49 +41,17 @@ pub fn conflict_to_ranges(constraint: &VersionConstraint) -> Ranges<ComposerVers
     constraint_to_ranges(constraint).complement()
 }
 
-fn split_and(s: &str) -> Vec<&str> {
-    if s.contains(',') {
-        return s
-            .split(',')
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .collect();
-    }
-    let mut out = Vec::new();
-    let mut start = 0;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            if start < i {
-                out.push(s[start..i].trim());
-            }
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            start = i;
-            continue;
-        }
-        i += 1;
-    }
-    if start < s.len() {
-        let t = s[start..].trim();
-        if !t.is_empty() {
-            out.push(t);
-        }
-    }
-    if out.is_empty() {
-        out.push(s);
-    }
-    out
-}
-
 fn single_to_ranges(clause: &str) -> Ranges<ComposerVersion> {
     let c = clause.trim().split('@').next().unwrap_or(clause).trim();
     if c.is_empty() || c == "*" {
         return Ranges::full();
     }
 
+    if let Some((from, to)) = c.split_once(" - ") {
+        if let Some(r) = hyphen_to_ranges(from.trim(), to.trim()) {
+            return r;
+        }
+    }
     if let Some(rest) = c.strip_prefix("^") {
         return caret_range(rest);
     }
@@ -128,6 +99,16 @@ fn single_to_ranges(clause: &str) -> Ranges<ComposerVersion> {
 
 fn parse_ver(s: &str) -> Option<ComposerVersion> {
     ComposerVersion::parse(s.trim().trim_start_matches('v')).ok()
+}
+
+fn hyphen_to_ranges(from: &str, to: &str) -> Option<Ranges<ComposerVersion>> {
+    let (lower, upper, exclusive) = hyphen_range_bounds(from, to)?;
+    let high = if exclusive {
+        Ranges::strictly_lower_than(upper)
+    } else {
+        Ranges::lower_than(upper)
+    };
+    Some(Ranges::higher_than(lower).intersection(&high))
 }
 
 fn caret_range(spec: &str) -> Ranges<ComposerVersion> {
@@ -227,5 +208,22 @@ mod tests {
         let r = conflict_to_ranges(&VersionConstraint::new("^1.0"));
         assert!(!r.contains(&ComposerVersion::parse("1.2.0").unwrap()));
         assert!(r.contains(&ComposerVersion::parse("2.0.0").unwrap()));
+    }
+
+    #[test]
+    fn spaced_ge_includes_newer_majors() {
+        let r = constraint_to_ranges(&VersionConstraint::new(">= 7.1"));
+        assert!(r.contains(&ComposerVersion::parse("7.1.0").unwrap()));
+        assert!(r.contains(&ComposerVersion::parse("8.5.9").unwrap()));
+        assert!(!r.contains(&ComposerVersion::parse("7.0.0").unwrap()));
+    }
+
+    #[test]
+    fn hyphen_range_php_branch() {
+        let r = constraint_to_ranges(&VersionConstraint::new("8.1 - 8.5"));
+        assert!(r.contains(&ComposerVersion::parse("8.1.0").unwrap()));
+        assert!(r.contains(&ComposerVersion::parse("8.5.9").unwrap()));
+        assert!(!r.contains(&ComposerVersion::parse("8.0.0").unwrap()));
+        assert!(!r.contains(&ComposerVersion::parse("8.6.0").unwrap()));
     }
 }
