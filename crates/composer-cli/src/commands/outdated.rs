@@ -222,6 +222,8 @@ pub async fn run(args: OutdatedArgs) -> Result<()> {
 
     let packages = lock.packages_to_install(with_dev);
     let mut rows = Vec::new();
+    let mut fetch_failures = 0usize;
+    let mut checked = 0usize;
 
     for pkg in packages {
         if args.direct && !root_names.contains(&pkg.name) {
@@ -232,9 +234,11 @@ pub async fn run(args: OutdatedArgs) -> Result<()> {
             Ok(v) => v,
             Err(e) => {
                 warning(&format!("{}: could not fetch metadata ({e})", pkg.name));
+                fetch_failures += 1;
                 continue;
             }
         };
+        checked += 1;
         let constraint = manifest
             .require
             .get(&pkg.name)
@@ -257,8 +261,10 @@ pub async fn run(args: OutdatedArgs) -> Result<()> {
 
     if args.format == "json" {
         println!("{}", serde_json::to_string_pretty(&rows)?);
-    } else if rows.is_empty() {
+    } else if rows.is_empty() && fetch_failures == 0 {
         info("All packages are up to date");
+    } else if rows.is_empty() {
+        warning("Could not verify every package; not treating the lock as up to date");
     } else {
         println!(
             "{:<3} {:<40} {:<16} {:<16} {:<16}",
@@ -279,6 +285,9 @@ pub async fn run(args: OutdatedArgs) -> Result<()> {
 
     // Composer: --strict fails when any package is outdated (semver-safe or major).
     let outdated_count = rows.iter().filter(|r| r.is_outdated()).count();
+    if args.strict && fetch_failures > 0 {
+        bail!("{fetch_failures} package(s) could not be checked (--strict); checked {checked}");
+    }
     if args.strict && outdated_count > 0 {
         bail!("{outdated_count} outdated package(s) (--strict)");
     }
@@ -322,6 +331,7 @@ mod tests {
             suggest: BTreeMap::new(),
             bin: vec![],
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 

@@ -28,6 +28,8 @@ pub struct RepositoryClient {
     memory: Arc<DashMap<String, CachedPackage>>,
     metadata_ttl: Duration,
     auth: AuthStore,
+    /// Composer `config.secure-http` (default true).
+    secure_http: bool,
 }
 
 #[derive(Clone)]
@@ -88,6 +90,7 @@ impl RemotePackageVersion {
             suggest: BTreeMap::new(),
             bin: self.bin.clone(),
             abandoned: self.abandoned.clone(),
+            unknown: BTreeMap::new(),
         }
     }
 
@@ -133,11 +136,17 @@ impl RepositoryClient {
             memory: Arc::new(DashMap::new()),
             metadata_ttl: Duration::from_secs(600),
             auth,
+            secure_http: true,
         })
     }
 
     pub fn with_auth(mut self, auth: AuthStore) -> Self {
         self.auth = auth;
+        self
+    }
+
+    pub fn with_secure_http(mut self, secure_http: bool) -> Self {
+        self.secure_http = secure_http;
         self
     }
 
@@ -150,7 +159,7 @@ impl RepositoryClient {
         &self,
         name: &PackageId,
     ) -> Result<Vec<RemotePackageVersion>> {
-        let key = name.as_str().to_string();
+        let key = self.metadata_identity(name.as_str());
 
         if let Some(cached) = self.memory.get(&key) {
             if cached.fetched_at.elapsed().unwrap_or(Duration::MAX) < self.metadata_ttl {
@@ -158,8 +167,8 @@ impl RepositoryClient {
             }
         }
 
-        // Disk cache
-        if let Some(versions) = self.load_disk_cache(&key)? {
+        // Disk cache (scoped by repository origin + auth, not package name alone)
+        if let Some(versions) = self.load_disk_cache(name.as_str())? {
             self.memory.insert(
                 key.clone(),
                 CachedPackage {
@@ -170,8 +179,15 @@ impl RepositoryClient {
             return Ok(versions);
         }
 
-        let url = format!("{}/p2/{}.json", self.base_url, key);
+        let url = format!("{}/p2/{}.json", self.base_url, name.as_str());
         debug!(%url, "fetching package metadata");
+
+        if is_insecure_http(&url) && self.secure_http {
+            return Err(Error::download(
+                &url,
+                "refusing insecure HTTP URL (set config.secure-http=false to allow)",
+            ));
+        }
 
         let builder = self.auth.apply_to_request(&url, self.http.get(&url));
         let resp = builder
@@ -180,7 +196,7 @@ impl RepositoryClient {
             .map_err(|e| Error::download(&url, e.to_string()))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(Error::PackageNotFound(key));
+            return Err(Error::PackageNotFound(name.to_string()));
         }
 
         if !resp.status().is_success() {
@@ -192,8 +208,8 @@ impl RepositoryClient {
             .await
             .map_err(|e| Error::download(&url, e.to_string()))?;
 
-        let versions = parse_p2_response(&key, &body)?;
-        self.save_disk_cache(&key, &body)?;
+        let versions = parse_p2_response(name.as_str(), &body)?;
+        self.save_disk_cache(name.as_str(), &body)?;
 
         self.memory.insert(
             key,
@@ -284,13 +300,31 @@ impl RepositoryClient {
         self.get_package_versions(name).await
     }
 
+    fn auth_fingerprint(&self) -> String {
+        match self.auth.for_url(&self.base_url) {
+            None => "anon".into(),
+            Some(auth) => blake3::hash(format!("{auth:?}").as_bytes())
+                .to_hex()
+                .to_string(),
+        }
+    }
+
+    fn metadata_identity(&self, package: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.base_url.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(package.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(self.auth_fingerprint().as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
     fn disk_path(&self, package: &str) -> PathBuf {
-        let hash = blake3::hash(package.as_bytes());
-        let hex = hash.to_hex();
+        let id = self.metadata_identity(package);
         metadata_dir()
             .join("p2")
-            .join(&hex.as_str()[..2])
-            .join(format!("{package}.json").replace('/', "_"))
+            .join(&id[..2])
+            .join(format!("{id}.json"))
     }
 
     fn load_disk_cache(&self, package: &str) -> Result<Option<Vec<RemotePackageVersion>>> {
@@ -352,25 +386,28 @@ impl RepositoryRegistry {
         let repos = manifest.repositories_list();
         let mut clients = Vec::new();
         let mut has_packagist = false;
+        let secure_http = manifest.secure_http();
 
         for repo in &repos {
             if let composer_manifest::Repository::Composer { url } = repo {
+                if secure_http && is_insecure_http(url) {
+                    return Err(Error::other(format!(
+                        "refusing insecure repository URL `{url}` \
+                         (set config.secure-http=false to allow HTTP)"
+                    )));
+                }
                 let normalized = url.trim_end_matches('/');
                 if normalized.contains("packagist.org") {
                     has_packagist = true;
                 }
-                clients.push(RepositoryClient::with_base_url_auth(url, auth.clone())?);
+                clients.push(
+                    RepositoryClient::with_base_url_auth(url, auth.clone())?
+                        .with_secure_http(secure_http),
+                );
             }
         }
 
         if manifest.packagist_enabled() && !has_packagist {
-            clients.push(RepositoryClient::with_base_url_auth(
-                DEFAULT_PACKAGIST,
-                auth.clone(),
-            )?);
-        }
-
-        if clients.is_empty() {
             clients.push(RepositoryClient::with_base_url_auth(
                 DEFAULT_PACKAGIST,
                 auth,
@@ -378,6 +415,11 @@ impl RepositoryRegistry {
         }
 
         Ok(Self { clients })
+    }
+
+    /// Number of HTTP repository clients (0 when only path/VCS/inline repos remain).
+    pub fn repository_count(&self) -> usize {
+        self.clients.len()
     }
 
     /// Fetch package versions, trying each repository in order.
@@ -450,6 +492,10 @@ impl RepositoryRegistry {
         }
         Err(last_no_match.unwrap_or_else(|| Error::PackageNotFound(name.to_string())))
     }
+}
+
+fn is_insecure_http(url: &str) -> bool {
+    url.trim().len() >= 7 && url.trim()[..7].eq_ignore_ascii_case("http://")
 }
 
 fn parse_min_stability(s: &str) -> composer_core::version::Stability {
@@ -744,5 +790,55 @@ mod tests {
         let al = versions[0].autoload.as_ref().expect("autoload");
         assert_eq!(al.classmap, vec!["src/Foo.php"]);
         assert_eq!(al.psr4.get("Acme\\").unwrap().paths(), vec!["src/", "lib/"]);
+    }
+
+    #[test]
+    fn metadata_identity_includes_origin() {
+        let a = RepositoryClient::with_base_url("https://repo-a.example").unwrap();
+        let b = RepositoryClient::with_base_url("https://repo-b.example").unwrap();
+        assert_ne!(
+            a.metadata_identity("acme/shared"),
+            b.metadata_identity("acme/shared")
+        );
+        assert_ne!(a.disk_path("acme/shared"), b.disk_path("acme/shared"));
+    }
+
+    #[test]
+    fn packagist_disabled_does_not_insert_default() {
+        let manifest = composer_manifest::ComposerJson::from_str(
+            r#"{"repositories":{"packagist.org":false}}"#,
+        )
+        .unwrap();
+        let reg = RepositoryRegistry::from_manifest_auth(&manifest, AuthStore::default()).unwrap();
+        assert_eq!(reg.repository_count(), 0);
+    }
+
+    #[test]
+    fn secure_http_rejects_plaintext_composer_repo() {
+        let manifest = composer_manifest::ComposerJson::from_str(
+            r#"{"repositories":[{"type":"composer","url":"http://repo.example"}]}"#,
+        )
+        .unwrap();
+        let err = match RepositoryRegistry::from_manifest_auth(&manifest, AuthStore::default()) {
+            Ok(_) => panic!("expected insecure HTTP to be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("insecure"), "{err}");
+    }
+
+    #[test]
+    fn secure_http_false_allows_plaintext_repo() {
+        let manifest = composer_manifest::ComposerJson::from_str(
+            r#"{
+                "config": {"secure-http": false},
+                "repositories": {
+                    "custom": {"type":"composer","url":"http://repo.example"},
+                    "packagist.org": false
+                }
+            }"#,
+        )
+        .unwrap();
+        let reg = RepositoryRegistry::from_manifest_auth(&manifest, AuthStore::default()).unwrap();
+        assert_eq!(reg.repository_count(), 1);
     }
 }

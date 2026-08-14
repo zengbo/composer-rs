@@ -211,6 +211,14 @@ pub async fn resolve(
         minimum_stability: composer_core::Stability::parse(&options.minimum_stability),
         root_replace: manifest.replace.keys().cloned().collect(),
         root_provide: manifest.provide.keys().cloned().collect(),
+        root_conflicts: manifest
+            .conflict
+            .iter()
+            .filter_map(|(name, c)| {
+                let id = PackageId::parse(name).ok()?;
+                Some((id, VersionConstraint::new(c)))
+            })
+            .collect(),
         platform,
         ignore_platform_reqs: options.ignore_platform_reqs,
         ignore_platform_req: options.ignore_platform_req.clone(),
@@ -441,6 +449,7 @@ mod partial_update_tests {
             suggest: BTreeMap::new(),
             bin: vec![],
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 

@@ -76,6 +76,7 @@ fn locked(name: &str, ver: &str) -> LockedPackage {
         suggest: BTreeMap::new(),
         bin: vec![],
         abandoned: None,
+        unknown: BTreeMap::new(),
     }
 }
 
@@ -121,6 +122,7 @@ async fn outdated_wanted_and_latest_from_mock_p2() {
         r#"{{
             "name": "acme/app",
             "require": {{ "php": ">=8.0", "acme/foo": "^1.0" }},
+            "config": {{ "secure-http": false }},
             "repositories": {{
                 "mock": {{ "type": "composer", "url": "{}/" }},
                 "packagist.org": false
@@ -185,6 +187,7 @@ async fn outdated_major_marker_when_at_constraint_ceiling() {
         r#"{{
             "name": "acme/app",
             "require": {{ "php": ">=8.0", "acme/bar": "^1.0" }},
+            "config": {{ "secure-http": false }},
             "repositories": {{
                 "mock": {{ "type": "composer", "url": "{}/" }},
                 "packagist.org": false

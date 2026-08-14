@@ -61,40 +61,52 @@ fn single_to_ranges(clause: &str) -> Ranges<ComposerVersion> {
     if c.ends_with(".*") || c.ends_with(".x") {
         return wildcard_range(c);
     }
+    // Longer operators first: `==` / `<>` must not fall through to `=` / `<`.
+    if let Some(rest) = c.strip_prefix("==") {
+        return parse_ver(rest)
+            .map(Ranges::singleton)
+            .unwrap_or_else(Ranges::empty);
+    }
+    if let Some(rest) = c.strip_prefix("<>") {
+        return parse_ver(rest)
+            .map(|v| Ranges::singleton(v).complement())
+            .unwrap_or_else(Ranges::empty);
+    }
     if let Some(rest) = c.strip_prefix(">=") {
         return parse_ver(rest)
             .map(Ranges::higher_than)
-            .unwrap_or_else(Ranges::full);
+            .unwrap_or_else(Ranges::empty);
     }
     if let Some(rest) = c.strip_prefix("<=") {
         return parse_ver(rest)
             .map(Ranges::lower_than)
-            .unwrap_or_else(Ranges::full);
+            .unwrap_or_else(Ranges::empty);
     }
     if let Some(rest) = c.strip_prefix("!=") {
         return parse_ver(rest)
             .map(|v| Ranges::singleton(v).complement())
-            .unwrap_or_else(Ranges::full);
+            .unwrap_or_else(Ranges::empty);
     }
     if let Some(rest) = c.strip_prefix('>') {
         return parse_ver(rest)
             .map(Ranges::strictly_higher_than)
-            .unwrap_or_else(Ranges::full);
+            .unwrap_or_else(Ranges::empty);
     }
     if let Some(rest) = c.strip_prefix('<') {
         return parse_ver(rest)
             .map(Ranges::strictly_lower_than)
-            .unwrap_or_else(Ranges::full);
+            .unwrap_or_else(Ranges::empty);
     }
     if let Some(rest) = c.strip_prefix('=') {
         return parse_ver(rest)
             .map(Ranges::singleton)
-            .unwrap_or_else(Ranges::full);
+            .unwrap_or_else(Ranges::empty);
     }
 
+    // Unparseable tokens must not become "any version".
     parse_ver(c)
         .map(Ranges::singleton)
-        .unwrap_or_else(Ranges::full)
+        .unwrap_or_else(Ranges::empty)
 }
 
 fn parse_ver(s: &str) -> Option<ComposerVersion> {
@@ -113,7 +125,7 @@ fn hyphen_to_ranges(from: &str, to: &str) -> Option<Ranges<ComposerVersion>> {
 
 fn caret_range(spec: &str) -> Ranges<ComposerVersion> {
     let Some(base) = parse_ver(spec) else {
-        return Ranges::full();
+        return Ranges::empty();
     };
     let (maj, min, pat) = parts(&base);
     let upper = if maj > 0 {
@@ -128,7 +140,7 @@ fn caret_range(spec: &str) -> Ranges<ComposerVersion> {
 
 fn tilde_range(spec: &str) -> Ranges<ComposerVersion> {
     let Some(base) = parse_ver(spec) else {
-        return Ranges::full();
+        return Ranges::empty();
     };
     let dots = spec.trim_start_matches('v').matches('.').count();
     let (maj, min, _) = parts(&base);
@@ -156,7 +168,7 @@ fn wildcard_range(spec: &str) -> Ranges<ComposerVersion> {
             let min: u64 = segs[1].parse().unwrap_or(0);
             Ranges::between(ver(maj, min, 0), ver(maj, min + 1, 0))
         }
-        _ => Ranges::full(),
+        _ => Ranges::empty(),
     }
 }
 
@@ -225,5 +237,26 @@ mod tests {
         assert!(r.contains(&ComposerVersion::parse("8.5.9").unwrap()));
         assert!(!r.contains(&ComposerVersion::parse("8.0.0").unwrap()));
         assert!(!r.contains(&ComposerVersion::parse("8.6.0").unwrap()));
+    }
+
+    #[test]
+    fn double_equals_is_exact() {
+        let r = constraint_to_ranges(&VersionConstraint::new("== 1.0.0"));
+        assert!(r.contains(&ComposerVersion::parse("1.0.0").unwrap()));
+        assert!(!r.contains(&ComposerVersion::parse("2.0.0").unwrap()));
+    }
+
+    #[test]
+    fn diamond_not_equal_excludes_version() {
+        let r = constraint_to_ranges(&VersionConstraint::new("<> 2.0.0"));
+        assert!(r.contains(&ComposerVersion::parse("1.0.0").unwrap()));
+        assert!(!r.contains(&ComposerVersion::parse("2.0.0").unwrap()));
+    }
+
+    #[test]
+    fn unparseable_operator_does_not_fail_open() {
+        let r = constraint_to_ranges(&VersionConstraint::new("== not-a-version"));
+        assert!(!r.contains(&ComposerVersion::parse("1.0.0").unwrap()));
+        assert!(!r.contains(&ComposerVersion::parse("9.9.9").unwrap()));
     }
 }

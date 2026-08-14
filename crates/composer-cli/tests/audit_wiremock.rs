@@ -40,6 +40,7 @@ fn locked(name: &str, ver: &str) -> LockedPackage {
         suggest: BTreeMap::new(),
         bin: vec![],
         abandoned: None,
+        unknown: BTreeMap::new(),
     }
 }
 
@@ -115,4 +116,44 @@ async fn audit_command_fails_when_advisory_matches_lock() {
     }
 
     assert!(!status.success(), "audit should fail when CVE matches lock");
+}
+
+#[tokio::test]
+async fn audit_command_fails_when_advisory_service_is_unavailable() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("composer.json"),
+        r#"{"name":"acme/app","require":{"acme/lib":"^1.0"}}"#,
+    )
+    .unwrap();
+    let lock = ComposerLock {
+        packages: vec![locked("acme/lib", "1.0.0")],
+        ..Default::default()
+    };
+    lock.save(&tmp.path().join("composer.lock")).unwrap();
+
+    let prev = std::env::var_os("COMPOSER_RS_AUDIT_URL");
+    unsafe {
+        std::env::set_var("COMPOSER_RS_AUDIT_URL", "http://127.0.0.1:9/");
+    }
+
+    let bin = env!("CARGO_BIN_EXE_composer-rs");
+    let status = Command::new(bin)
+        .arg("audit")
+        .current_dir(tmp.path())
+        .status()
+        .expect("spawn audit");
+
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("COMPOSER_RS_AUDIT_URL", v),
+            None => std::env::remove_var("COMPOSER_RS_AUDIT_URL"),
+        }
+    }
+
+    assert!(
+        !status.success(),
+        "audit must fail closed when the advisory service is unreachable"
+    );
 }

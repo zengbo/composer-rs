@@ -125,6 +125,21 @@ impl InstallerPaths {
         None
     }
 
+    /// Path of an installed package relative to `vendor/composer`.
+    pub fn install_path_from_composer(
+        &self,
+        package_name: &str,
+        package_type: Option<&str>,
+        project_root: &Path,
+        vendor_dir: &Path,
+    ) -> String {
+        if let Some(rel) = self.resolve_relative(package_name, package_type) {
+            let dest = project_root.join(rel);
+            return lexical_relative(&vendor_dir.join("composer"), &dest);
+        }
+        format!("../{package_name}")
+    }
+
     /// Path relative to project root (for lock metadata / display).
     pub fn resolve_relative(
         &self,
@@ -166,6 +181,26 @@ fn parse_matcher(s: &str) -> Option<PathMatcher> {
         return Some(PathMatcher::Package(s.to_string()));
     }
     None
+}
+
+fn lexical_relative(from_dir: &Path, to: &Path) -> String {
+    let from_comps: Vec<_> = from_dir.components().collect();
+    let to_comps: Vec<_> = to.components().collect();
+    let mut i = 0;
+    while i < from_comps.len() && i < to_comps.len() && from_comps[i] == to_comps[i] {
+        i += 1;
+    }
+    let mut out = PathBuf::new();
+    for _ in i..from_comps.len() {
+        out.push("..");
+    }
+    for c in &to_comps[i..] {
+        out.push(c);
+    }
+    if out.as_os_str().is_empty() {
+        return ".".into();
+    }
+    out.to_string_lossy().replace('\\', "/")
 }
 
 fn expand_template(template: &str, package_name: &str) -> String {
@@ -215,5 +250,22 @@ mod tests {
                 .resolve(root, "symfony/console", Some("library"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn install_path_from_composer_uses_custom_root() {
+        let extra = json!({
+            "installer-paths": {
+                "wp-content/plugins/{$name}": ["type:wordpress-plugin"]
+            }
+        });
+        let paths = InstallerPaths::from_extra(Some(&extra));
+        let rel = paths.install_path_from_composer(
+            "vendor/akismet",
+            Some("wordpress-plugin"),
+            Path::new("/proj"),
+            Path::new("/proj/vendor"),
+        );
+        assert_eq!(rel, "../../wp-content/plugins/akismet");
     }
 }

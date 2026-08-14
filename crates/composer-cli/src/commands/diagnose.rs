@@ -1,7 +1,7 @@
 //! `composer-rs diagnose`
 
 use super::{info, project_paths, success, warning};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Args;
 use composer_auth::{AuthStore, global_auth_path};
 use composer_cache::cache_root;
@@ -90,8 +90,9 @@ pub async fn run(_args: DiagnoseArgs) -> Result<()> {
 
     if ok {
         success("diagnose: all critical checks passed");
+        Ok(())
     } else {
         warning("diagnose: some checks failed — see above");
+        bail!("diagnose: some checks failed");
     }
-    Ok(())
 }

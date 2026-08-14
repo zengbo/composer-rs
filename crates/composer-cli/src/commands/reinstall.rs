@@ -87,6 +87,7 @@ pub async fn run(args: ReinstallArgs) -> Result<()> {
         .with_project_root(&cwd)
         .with_installer_paths(installer_paths.clone())
         .with_prefer_dist(prefer_dist)
+        .with_secure_http(manifest.secure_http())
         .with_auth(auth);
     let refs: Vec<_> = targets.iter().copied().collect();
     installer.install_all(&refs, &vendor).await?;

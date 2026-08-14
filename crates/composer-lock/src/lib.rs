@@ -47,6 +47,10 @@ pub struct ComposerLock {
 
     #[serde(rename = "plugin-api-version", default = "default_plugin_api")]
     pub plugin_api_version: String,
+
+    /// Unknown Composer lock keys preserved across load/save.
+    #[serde(flatten, default)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_stability() -> String {
@@ -76,6 +80,7 @@ impl Default for ComposerLock {
             platform: BTreeMap::new(),
             platform_dev: BTreeMap::new(),
             plugin_api_version: default_plugin_api(),
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -110,6 +115,36 @@ impl ComposerLock {
             pkgs.extend(self.packages_dev.iter());
         }
         pkgs
+    }
+
+    /// Root `require` / `require-dev` entries that are not satisfied by this lock.
+    ///
+    /// Platform packages are ignored. A name is satisfied by a locked package of
+    /// that name whose version matches the constraint, or by a locked package
+    /// that `provide`s / `replace`s it at a matching version.
+    pub fn unsatisfied_root_requirements(
+        &self,
+        require: &BTreeMap<String, String>,
+        require_dev: &BTreeMap<String, String>,
+        with_dev: bool,
+    ) -> Vec<(String, String)> {
+        let packages = self.packages_to_install(with_dev);
+        let mut missing = Vec::new();
+        let iter: Box<dyn Iterator<Item = (&String, &String)>> = if with_dev {
+            Box::new(require.iter().chain(require_dev.iter()))
+        } else {
+            Box::new(require.iter())
+        };
+        for (name, constraint) in iter {
+            if PackageId::parse(name).is_ok_and(|p| p.is_platform()) {
+                continue;
+            }
+            if lock_requirement_satisfied(&packages, name, constraint) {
+                continue;
+            }
+            missing.push((name.clone(), constraint.clone()));
+        }
+        missing
     }
 
     pub fn find(&self, name: &str) -> Option<&LockedPackage> {
@@ -186,6 +221,37 @@ fn locked_from_installed_entry(mut value: serde_json::Value) -> Result<LockedPac
         wrap_string_as_array(obj, "keywords");
     }
     serde_json::from_value(value).map_err(|e| Error::Lockfile(e.to_string()))
+}
+
+fn lock_requirement_satisfied(packages: &[&LockedPackage], name: &str, constraint: &str) -> bool {
+    use composer_core::{ComposerVersion, VersionConstraint};
+    let wanted = VersionConstraint::new(constraint);
+    for pkg in packages {
+        if pkg.name == name {
+            if let Ok(ver) = ComposerVersion::parse(&pkg.version) {
+                if wanted.matches(&ver) {
+                    return true;
+                }
+            }
+        }
+        for (virt, virt_c) in pkg.provide.iter().chain(pkg.replace.iter()) {
+            if virt != name {
+                continue;
+            }
+            let provided = virt_c.trim();
+            let raw = if provided == "self.version" || provided == "*" || provided.is_empty() {
+                pkg.version.as_str()
+            } else {
+                provided.trim_start_matches('=')
+            };
+            if let Ok(ver) = ComposerVersion::parse(raw) {
+                if wanted.matches(&ver) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn wrap_string_as_array(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
@@ -275,6 +341,10 @@ pub struct LockedPackage {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned: Option<serde_json::Value>,
+
+    /// Unknown package keys preserved across load/save.
+    #[serde(flatten, default)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 impl LockedPackage {
@@ -404,6 +474,7 @@ mod tests {
                 suggest: BTreeMap::new(),
                 bin: vec![],
                 abandoned: None,
+                unknown: BTreeMap::new(),
             }],
             ..Default::default()
         };
@@ -443,10 +514,42 @@ mod tests {
             suggest: BTreeMap::new(),
             bin: vec![],
             abandoned: None,
+            unknown: BTreeMap::new(),
         };
         assert!(!pkg.path_symlink());
         pkg.extra = None;
         assert!(pkg.path_symlink());
+    }
+
+    #[test]
+    fn preserves_unknown_lock_fields() {
+        let json = r#"{
+            "content-hash": "abc",
+            "packages": [
+                {
+                    "name": "acme/lib",
+                    "version": "1.0.0",
+                    "custom-pkg-key": 7
+                }
+            ],
+            "packages-dev": [],
+            "custom-top-key": {"ok": true}
+        }"#;
+        let lock = ComposerLock::from_str(json).unwrap();
+        assert_eq!(lock.unknown.get("custom-top-key").unwrap()["ok"], true);
+        assert_eq!(lock.packages[0].unknown.get("custom-pkg-key").unwrap(), 7);
+        let out = serde_json::to_value(&lock).unwrap();
+        assert_eq!(out["custom-top-key"]["ok"], true);
+        assert_eq!(out["packages"][0]["custom-pkg-key"], 7);
+    }
+
+    #[test]
+    fn unsatisfied_root_requirements_detects_missing_package() {
+        let lock = ComposerLock::default();
+        let mut require = BTreeMap::new();
+        require.insert("acme/required".into(), "1.0.0".into());
+        let missing = lock.unsatisfied_root_requirements(&require, &BTreeMap::new(), true);
+        assert_eq!(missing, vec![("acme/required".into(), "1.0.0".into())]);
     }
 
     #[test]

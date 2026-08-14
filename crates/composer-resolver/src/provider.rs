@@ -4,18 +4,19 @@ use crate::index::PackageIndex;
 use composer_core::error::{Error, Result};
 use composer_core::{
     ComposerVersion, PackageId, Platform, Stability, VersionConstraint,
-    check_requirements_filtered, conflict_to_ranges, constraint_to_ranges,
+    check_requirements_filtered, constraint_to_ranges,
 };
 use composer_lock::LockedPackage;
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, OfflineDependencyProvider,
     PackageResolutionStatistics, Ranges, resolve,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use tracing::debug;
 
 const ROOT: &str = "__root__/__root__";
+const CONFLICT_PREFIX: &str = "__composer_rs_conflict__/";
 
 #[derive(Debug, Clone)]
 pub struct SolveRequest {
@@ -25,6 +26,7 @@ pub struct SolveRequest {
     pub minimum_stability: Stability,
     pub root_replace: Vec<String>,
     pub root_provide: Vec<String>,
+    pub root_conflicts: Vec<(PackageId, VersionConstraint)>,
     pub platform: Platform,
     pub ignore_platform_reqs: bool,
     pub ignore_platform_req: Vec<String>,
@@ -52,7 +54,7 @@ pub fn solve_with_pubgrub(
 
     let mut out = HashMap::new();
     for (name, version) in solution {
-        if name == ROOT {
+        if name == ROOT || name.starts_with(CONFLICT_PREFIX) {
             continue;
         }
         let raw = version.raw.clone();
@@ -74,6 +76,7 @@ pub fn solve_with_pubgrub(
         }
     }
     validate_conflicts(&out)?;
+    validate_root_conflicts(&out, &request.root_conflicts)?;
     Ok(out)
 }
 
@@ -134,30 +137,6 @@ fn version_matches_platform(
     check_requirements_filtered(platform, &locked.require, ignore_patterns).is_ok()
 }
 
-/// Names reachable from root via `require` edges (any version's requires).
-fn reachable_package_names(
-    index: &PackageIndex,
-    roots: &[(PackageId, VersionConstraint)],
-) -> HashSet<String> {
-    let mut seen = HashSet::new();
-    let mut q: VecDeque<String> = roots.iter().map(|(id, _)| id.to_string()).collect();
-    while let Some(name) = q.pop_front() {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        if let Some(versions) = index.versions_of(&name) {
-            for v in versions {
-                for dep in v.require.keys() {
-                    if PackageId::parse(dep).is_ok_and(|p| !p.is_platform()) {
-                        q.push_back(dep.clone());
-                    }
-                }
-            }
-        }
-    }
-    seen
-}
-
 /// Reject solutions where an installed package violates another's `conflict` map.
 /// Kept as a safety net after encoding conflicts in the PubGrub graph.
 fn validate_conflicts(selected: &HashMap<String, LockedPackage>) -> Result<()> {
@@ -178,6 +157,99 @@ fn validate_conflicts(selected: &HashMap<String, LockedPackage>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_root_conflicts(
+    selected: &HashMap<String, LockedPackage>,
+    root_conflicts: &[(PackageId, VersionConstraint)],
+) -> Result<()> {
+    for (id, constraint) in root_conflicts {
+        let Some(other) = selected.get(id.as_str()) else {
+            continue;
+        };
+        let other_version =
+            ComposerVersion::parse(&other.version).map_err(|e| Error::Resolve(e.to_string()))?;
+        if constraint.matches(&other_version) {
+            return Err(Error::Resolve(format!(
+                "root project conflicts with {}@{} (constraint {})",
+                id, other.version, constraint
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn conflict_dummy_name(left: &str, right: &str, constraint: &str) -> String {
+    format!("{CONFLICT_PREFIX}{left}::{right}::{constraint}")
+}
+
+fn ensure_conflict_dummy(
+    graph: &mut HashMap<
+        String,
+        Vec<(
+            ComposerVersion,
+            DependencyConstraints<String, Ranges<ComposerVersion>>,
+        )>,
+    >,
+    name: &str,
+) {
+    if graph.contains_key(name) {
+        return;
+    }
+    let v1 = ComposerVersion::parse("1.0.0").expect("1.0.0 parses");
+    let v2 = ComposerVersion::parse("2.0.0").expect("2.0.0 parses");
+    graph.insert(
+        name.to_string(),
+        vec![
+            (v1, DependencyConstraints::default()),
+            (v2, DependencyConstraints::default()),
+        ],
+    );
+}
+
+fn add_dep_on_version(
+    graph: &mut HashMap<
+        String,
+        Vec<(
+            ComposerVersion,
+            DependencyConstraints<String, Ranges<ComposerVersion>>,
+        )>,
+    >,
+    package: &str,
+    version: &ComposerVersion,
+    dep: &str,
+    range: Ranges<ComposerVersion>,
+) {
+    if let Some(versions) = graph.get_mut(package) {
+        for (v, deps) in versions {
+            if v == version {
+                deps.insert(dep.to_string(), range);
+                return;
+            }
+        }
+    }
+}
+
+fn add_dep_on_matching(
+    graph: &mut HashMap<
+        String,
+        Vec<(
+            ComposerVersion,
+            DependencyConstraints<String, Ranges<ComposerVersion>>,
+        )>,
+    >,
+    package: &str,
+    constraint: &VersionConstraint,
+    dep: &str,
+    range: &Ranges<ComposerVersion>,
+) {
+    if let Some(versions) = graph.get_mut(package) {
+        for (v, deps) in versions {
+            if constraint.matches(v) {
+                deps.insert(dep.to_string(), range.clone());
+            }
+        }
+    }
 }
 
 /// Custom provider so we can prefer-stable / prefer-lowest and skip platform pkgs.
@@ -223,10 +295,8 @@ impl ComposerOfflineProvider {
         let root_ver = ComposerVersion::parse("1.0.0").unwrap();
         graph.insert(ROOT.into(), vec![(root_ver, root_deps)]);
 
-        // Only encode `conflict` against packages that can actually appear in the
-        // solution. Adding complement-deps for unused names would force PubGrub
-        // to install them just to satisfy the conflict edge.
-        let reachable = reachable_package_names(index, &request.root_deps);
+        let mut pending_conflicts: Vec<(String, ComposerVersion, String, VersionConstraint)> =
+            Vec::new();
 
         for name in index.package_names() {
             let mut versions = Vec::new();
@@ -268,11 +338,12 @@ impl ComposerOfflineProvider {
                     if PackageId::parse(other).is_ok_and(|p| p.is_platform()) {
                         continue;
                     }
-                    if !reachable.contains(other) {
-                        continue;
-                    }
-                    let allowed = conflict_to_ranges(&VersionConstraint::new(constraint_str));
-                    deps.insert(other.clone(), allowed);
+                    pending_conflicts.push((
+                        name.clone(),
+                        iv.version.clone(),
+                        other.clone(),
+                        VersionConstraint::new(constraint_str),
+                    ));
                 }
 
                 versions.push((iv.version.clone(), deps));
@@ -283,6 +354,34 @@ impl ComposerOfflineProvider {
                 versions.sort_by(|a, b| a.0.cmp(&b.0));
                 graph.insert(name.clone(), versions);
             }
+        }
+
+        // Encode A conflicts B as a mutex dummy rather than a positive dep on B.
+        // That keeps B out of the graph unless some real require edge selects it.
+        let dummy_one = Ranges::singleton(ComposerVersion::parse("1.0.0").expect("1.0.0 parses"));
+        let dummy_two = Ranges::singleton(ComposerVersion::parse("2.0.0").expect("2.0.0 parses"));
+
+        for (from, from_ver, other, constraint) in &pending_conflicts {
+            let dummy = conflict_dummy_name(from, other, constraint.as_str());
+            ensure_conflict_dummy(&mut graph, &dummy);
+            add_dep_on_version(&mut graph, from, from_ver, &dummy, dummy_one.clone());
+            add_dep_on_matching(&mut graph, other, constraint, &dummy, &dummy_two);
+        }
+
+        for (id, constraint) in &request.root_conflicts {
+            if id.is_platform() {
+                continue;
+            }
+            let dummy = conflict_dummy_name(ROOT, id.as_str(), constraint.as_str());
+            ensure_conflict_dummy(&mut graph, &dummy);
+            add_dep_on_version(
+                &mut graph,
+                ROOT,
+                &ComposerVersion::parse("1.0.0").expect("1.0.0 parses"),
+                &dummy,
+                dummy_one.clone(),
+            );
+            add_dep_on_matching(&mut graph, id.as_str(), constraint, &dummy, &dummy_two);
         }
 
         let _ = request.minimum_stability;
@@ -420,6 +519,7 @@ mod tests {
             suggest: BTreeMap::new(),
             bin: vec![],
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 
@@ -450,6 +550,7 @@ mod tests {
             minimum_stability: Stability::Stable,
             root_replace: vec![],
             root_provide: vec![],
+            root_conflicts: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
             ignore_platform_req: vec![],
@@ -485,6 +586,7 @@ mod tests {
             minimum_stability: Stability::Stable,
             root_replace: vec![],
             root_provide: vec![],
+            root_conflicts: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
             ignore_platform_req: vec![],
@@ -522,6 +624,7 @@ mod tests {
             minimum_stability: Stability::Stable,
             root_replace: vec![],
             root_provide: vec![],
+            root_conflicts: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
             ignore_platform_req: vec![],
@@ -561,6 +664,7 @@ mod tests {
             minimum_stability: Stability::Stable,
             root_replace: vec![],
             root_provide: vec![],
+            root_conflicts: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
             ignore_platform_req: vec![],
@@ -602,6 +706,7 @@ mod tests {
             minimum_stability: Stability::Stable,
             root_replace: vec![],
             root_provide: vec![],
+            root_conflicts: vec![],
             platform: Platform::with_php("8.2.0").unwrap(),
             ignore_platform_reqs: false,
             ignore_platform_req: vec![],
@@ -612,6 +717,82 @@ mod tests {
         assert_eq!(
             sol["vendor/b"].version, "2.0.0",
             "solver should skip B 1.x due to A's conflict"
+        );
+    }
+
+    #[test]
+    fn root_conflict_rejects_matching_version() {
+        let mut index = PackageIndex::new();
+        index.insert_locked(pkg("acme/bad", "1.0.0", &[]));
+
+        let request = SolveRequest {
+            root_deps: vec![(
+                PackageId::parse("acme/bad").unwrap(),
+                VersionConstraint::new("*"),
+            )],
+            prefer_stable: true,
+            prefer_lowest: false,
+            minimum_stability: Stability::Stable,
+            root_replace: vec![],
+            root_provide: vec![],
+            root_conflicts: vec![(
+                PackageId::parse("acme/bad").unwrap(),
+                VersionConstraint::new("<2.0"),
+            )],
+            platform: Platform::with_php("8.2.0").unwrap(),
+            ignore_platform_reqs: false,
+            ignore_platform_req: vec![],
+        };
+
+        let err = solve_with_pubgrub(&index, &request).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflicts") || msg.contains("PubGrub") || msg.contains("could not"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn conflict_does_not_force_optional_package() {
+        // A 1.0 requires B; A 2.0 has no deps. C conflicts with B ^1.
+        // Valid solution: A 2.0 + C 1.0, without B.
+        let mut index = PackageIndex::new();
+        index.insert_locked(pkg("acme/a", "1.0.0", &[("acme/b", "^1")]));
+        index.insert_locked(pkg("acme/a", "2.0.0", &[]));
+        index.insert_locked(pkg("acme/b", "1.0.0", &[]));
+        let mut c = pkg("acme/c", "1.0.0", &[]);
+        c.conflict.insert("acme/b".into(), "^1".into());
+        index.insert_locked(c);
+
+        let request = SolveRequest {
+            root_deps: vec![
+                (
+                    PackageId::parse("acme/a").unwrap(),
+                    VersionConstraint::new("*"),
+                ),
+                (
+                    PackageId::parse("acme/c").unwrap(),
+                    VersionConstraint::new("*"),
+                ),
+            ],
+            prefer_stable: true,
+            prefer_lowest: false,
+            minimum_stability: Stability::Stable,
+            root_replace: vec![],
+            root_provide: vec![],
+            root_conflicts: vec![],
+            platform: Platform::with_php("8.2.0").unwrap(),
+            ignore_platform_reqs: false,
+            ignore_platform_req: vec![],
+        };
+
+        let sol = solve_with_pubgrub(&index, &request).unwrap();
+        assert_eq!(sol["acme/a"].version, "2.0.0");
+        assert_eq!(sol["acme/c"].version, "1.0.0");
+        assert!(
+            !sol.contains_key("acme/b"),
+            "B must stay optional: {:?}",
+            sol.keys().collect::<Vec<_>>()
         );
     }
 }

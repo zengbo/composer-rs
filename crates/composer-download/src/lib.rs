@@ -86,6 +86,7 @@ pub struct PackageInstaller {
     project_root: PathBuf,
     installer_paths: InstallerPaths,
     auth: AuthStore,
+    secure_http: bool,
 }
 
 impl PackageInstaller {
@@ -112,11 +113,17 @@ impl PackageInstaller {
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             installer_paths: InstallerPaths::default(),
             auth: AuthStore::default(),
+            secure_http: true,
         })
     }
 
     pub fn with_auth(mut self, auth: AuthStore) -> Self {
         self.auth = auth;
+        self
+    }
+
+    pub fn with_secure_http(mut self, secure_http: bool) -> Self {
+        self.secure_http = secure_http;
         self
     }
 
@@ -146,6 +153,35 @@ impl PackageInstaller {
 
     pub fn cache(&self) -> &CasCache {
         &self.cache
+    }
+
+    /// Download a package dist archive to the archive cache (no extract).
+    pub async fn download_dist_archive(&self, pkg: &LockedPackage) -> Result<PathBuf> {
+        let urls = dist_urls(pkg);
+        if urls.is_empty() {
+            return Err(Error::other(format!(
+                "package {} has no dist URL",
+                pkg.name
+            )));
+        }
+        let mut last_err = None;
+        for url in &urls {
+            match download_to_archives(
+                &self.http,
+                url,
+                &pkg.name,
+                &self.auth,
+                self.secure_http,
+                None,
+            )
+            .await
+            {
+                Ok(p) => return Ok(p),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| Error::other(format!("package {} has no dist URL", pkg.name))))
     }
 
     /// Install many locked packages into `vendor_dir` in parallel.
@@ -189,6 +225,7 @@ impl PackageInstaller {
             let prefer_dist = self.prefer_dist;
             let auth = self.auth.clone();
             let progress = progress.clone();
+            let secure_http = self.secure_http;
 
             futs.push(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
@@ -206,6 +243,7 @@ impl PackageInstaller {
                     verify,
                     prefer_dist,
                     &auth,
+                    secure_http,
                     progress.as_deref(),
                 )
                 .await;
@@ -264,6 +302,7 @@ async fn install_one(
     verify_checksums: bool,
     prefer_dist: bool,
     auth: &AuthStore,
+    secure_http: bool,
     progress: Option<&InstallProgress>,
 ) -> Result<()> {
     let dest = package_dest(pkg, vendor_dir, project_root, installer_paths)?;
@@ -285,6 +324,7 @@ async fn install_one(
                         &dest,
                         verify_checksums,
                         auth,
+                        secure_http,
                         progress,
                     )
                     .await
@@ -303,6 +343,7 @@ async fn install_one(
                     &dest,
                     verify_checksums,
                     auth,
+                    secure_http,
                     progress,
                 )
                 .await
@@ -321,6 +362,7 @@ async fn install_one(
                 &dest,
                 verify_checksums,
                 auth,
+                secure_http,
                 progress,
             )
             .await
@@ -395,6 +437,7 @@ async fn install_dist_package(
     dest: &Path,
     verify_checksums: bool,
     auth: &AuthStore,
+    secure_http: bool,
     progress: Option<&InstallProgress>,
 ) -> Result<()> {
     let key = pkg.cache_key();
@@ -420,7 +463,7 @@ async fn install_dist_package(
     let mut last_err = None;
     let mut archive_path = None;
     for url in &urls {
-        match download_to_archives(http, url, &pkg.name, auth, progress).await {
+        match download_to_archives(http, url, &pkg.name, auth, secure_http, progress).await {
             Ok(p) => {
                 archive_path = Some(p);
                 break;
@@ -508,8 +551,15 @@ async fn download_to_archives(
     url: &str,
     package_name: &str,
     auth: &AuthStore,
+    secure_http: bool,
     progress: Option<&InstallProgress>,
 ) -> Result<PathBuf> {
+    if secure_http && url.trim().len() >= 7 && url.trim()[..7].eq_ignore_ascii_case("http://") {
+        return Err(Error::download(
+            url,
+            "refusing insecure HTTP URL (set config.secure-http=false to allow)",
+        ));
+    }
     let dir = archives_dir();
     std::fs::create_dir_all(&dir).map_err(|e| Error::io(dir.as_path(), e))?;
 
@@ -517,12 +567,37 @@ async fn download_to_archives(
     let ext = guess_extension(url);
     let path = dir.join(format!("{}.{}", hash.to_hex(), ext));
 
+    let lock_path = path.with_extension(format!("{ext}.lock"));
+    let _lock = {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| Error::io(&lock_path, e))?;
+        use fs4::fs_std::FileExt;
+        file.lock_exclusive()
+            .map_err(|e| Error::Cache(format!("lock {}: {e}", lock_path.display())))?;
+        file
+    };
+
     if path.is_file() {
         debug!(%url, "archive already on disk");
         return Ok(path);
     }
 
-    let partial = path.with_extension(format!("{ext}.partial"));
+    let partial = dir.join(format!(
+        "{}.{ext}.partial-{}-{}",
+        hash.to_hex(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let mut attempt = 0;
     let max_attempts = 4;
 
@@ -698,7 +773,9 @@ async fn install_vcs_package(
         .join("vcs")
         .join(hash.to_hex().as_str());
 
-    if !cache_dir.join(".git").is_dir() {
+    let marker = cache_dir.join(".composer-rs-vcs-complete");
+    let need_clone = !cache_dir.join(".git").is_dir() || !marker.is_file();
+    if need_clone {
         if cache_dir.exists() {
             std::fs::remove_dir_all(&cache_dir).map_err(|e| Error::io(&cache_dir, e))?;
         }
@@ -724,10 +801,14 @@ async fn install_vcs_package(
         if !status.success() {
             return Err(Error::other(format!("git clone failed for {}", source.url)));
         }
+    }
 
-        if let Some(reference) = &source.reference {
-            // For SHAs, a shallow clone of default branch may not contain the
-            // commit — fetch it explicitly when checkout fails.
+    if let Some(reference) = &source.reference {
+        let head = git_rev_parse(&cache_dir).await;
+        let matches = head.as_deref().is_some_and(|h| {
+            h == reference || reference.starts_with(h) || h.starts_with(reference)
+        });
+        if !matches {
             let checkout = tokio::process::Command::new("git")
                 .args(["-C"])
                 .arg(&cache_dir)
@@ -764,7 +845,18 @@ async fn install_vcs_package(
                 }
             }
         }
+        let head = git_rev_parse(&cache_dir).await.unwrap_or_default();
+        if is_commit_sha(reference)
+            && !(head == *reference || head.starts_with(reference) || reference.starts_with(&head))
+        {
+            return Err(Error::other(format!(
+                "git checkout {reference} left HEAD at {head} for {}",
+                source.url
+            )));
+        }
     }
+
+    std::fs::write(&marker, cache_key.as_bytes()).map_err(|e| Error::io(&marker, e))?;
 
     if dest.exists() {
         std::fs::remove_dir_all(dest).map_err(|e| Error::io(dest, e))?;
@@ -781,17 +873,33 @@ async fn install_vcs_package(
     Ok(())
 }
 
+async fn git_rev_parse(dir: &Path) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C"])
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn is_commit_sha(reference: &str) -> bool {
+    let r = reference.trim();
+    (7..=40).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// True for refs safe to pass as `git clone --branch` (not a bare commit SHA).
 fn is_git_branch_or_tag(reference: &str) -> bool {
     let r = reference.trim();
     if r.is_empty() {
         return false;
     }
-    // 7–40 hex chars → treat as commit-ish, not a branch name.
-    if (7..=40).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit()) {
-        return false;
-    }
-    true
+    !is_commit_sha(r)
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
@@ -803,6 +911,8 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         let ft = entry.file_type().map_err(|e| Error::io(&from, e))?;
         if ft.is_dir() {
             copy_dir(&from, &to)?;
+        } else if ft.is_symlink() {
+            copy_symlink(&from, &to)?;
         } else if ft.is_file() {
             std::fs::copy(&from, &to).map_err(|e| Error::io(&to, e))?;
         }
@@ -814,7 +924,7 @@ fn copy_dir_excluding_git(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| Error::io(dst, e))?;
     for entry in std::fs::read_dir(src).map_err(|e| Error::io(src, e))? {
         let entry = entry.map_err(|e| Error::io(src, e))?;
-        if entry.file_name() == ".git" {
+        if entry.file_name() == ".git" || entry.file_name() == ".composer-rs-vcs-complete" {
             continue;
         }
         let from = entry.path();
@@ -822,10 +932,70 @@ fn copy_dir_excluding_git(src: &Path, dst: &Path) -> Result<()> {
         let ft = entry.file_type().map_err(|e| Error::io(&from, e))?;
         if ft.is_dir() {
             copy_dir_excluding_git(&from, &to)?;
+        } else if ft.is_symlink() {
+            copy_symlink(&from, &to)?;
         } else if ft.is_file() {
             std::fs::copy(&from, &to).map_err(|e| Error::io(&to, e))?;
         }
     }
+    Ok(())
+}
+
+fn copy_symlink(from: &Path, to: &Path) -> Result<()> {
+    let target = std::fs::read_link(from).map_err(|e| Error::io(from, e))?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, to).map_err(|e| Error::io(to, e))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        if from.is_file() {
+            std::fs::copy(from, to).map_err(|e| Error::io(to, e))?;
+            return Ok(());
+        }
+        Err(Error::other(format!(
+            "cannot copy symlink {} on this platform",
+            from.display()
+        )))
+    }
+}
+
+/// If `dest` has no top-level `composer.json` but a single child directory does,
+/// move that child up so `dest` is the package root.
+pub fn promote_extracted_package_root(dest: &Path) -> Result<()> {
+    if dest.join("composer.json").is_file() {
+        return Ok(());
+    }
+    let inner = unwrap_single_root(dest)?;
+    if inner == dest {
+        return Ok(());
+    }
+    let staging = dest.with_file_name(format!(
+        "{}.composer-rs-unwrap-{}",
+        dest.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| Error::io(&staging, e))?;
+    }
+    std::fs::rename(&inner, &staging).map_err(|e| Error::io(&inner, e))?;
+    for entry in std::fs::read_dir(dest).map_err(|e| Error::io(dest, e))? {
+        let entry = entry.map_err(|e| Error::io(dest, e))?;
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    for entry in std::fs::read_dir(&staging).map_err(|e| Error::io(&staging, e))? {
+        let entry = entry.map_err(|e| Error::io(&staging, e))?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        std::fs::rename(&from, &to).map_err(|e| Error::io(&to, e))?;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
     Ok(())
 }
 
@@ -885,6 +1055,7 @@ mod tests {
             suggest: BTreeMap::new(),
             bin: vec![],
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 

@@ -276,6 +276,15 @@ impl ComposerJson {
         parse_repositories(self.repositories.as_ref())
     }
 
+    /// Composer `config.secure-http` (default true): reject plaintext HTTP remotes.
+    pub fn secure_http(&self) -> bool {
+        self.config
+            .as_ref()
+            .and_then(|c| c.get("secure-http"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
     /// Whether Packagist is enabled (default true unless `packagist.org: false`).
     pub fn packagist_enabled(&self) -> bool {
         let Some(value) = &self.repositories else {

@@ -67,14 +67,17 @@ pub fn install_bins(
                 let _ = fs::remove_file(&dest);
             }
             link_or_copy(&src, &dest)?;
-            // Best-effort executable bit on Unix.
+            // Best-effort executable bit on Unix. Do not chmod through a
+            // symlink: that would mutate a shared CAS inode.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&dest) {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(perms.mode() | 0o755);
-                    let _ = fs::set_permissions(&dest, perms);
+                if !dest.is_symlink() {
+                    if let Ok(meta) = fs::metadata(&dest) {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(perms.mode() | 0o755);
+                        let _ = fs::set_permissions(&dest, perms);
+                    }
                 }
             }
             owners.insert(name.clone(), pkg.name.clone());
@@ -178,6 +181,7 @@ mod tests {
             suggest: BTreeMap::new(),
             bin: bins.iter().map(|s| (*s).to_string()).collect(),
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 

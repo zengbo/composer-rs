@@ -124,13 +124,15 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_lifecycle(
-        &manifest,
-        ScriptEvent::PreUpdateCmd,
-        &cwd,
-        args.no_scripts,
-        with_dev,
-    )?;
+    if !args.dry_run {
+        run_lifecycle(
+            &manifest,
+            ScriptEvent::PreUpdateCmd,
+            &cwd,
+            args.no_scripts,
+            with_dev,
+        )?;
+    }
 
     let existing_lock = if lock_path.exists() && !args.packages.is_empty() {
         Some(composer_lock::ComposerLock::load(&lock_path)?)
@@ -162,17 +164,6 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         lock.packages_dev.len()
     ));
 
-    if args.dry_run {
-        for p in lock.packages_to_install(with_dev) {
-            let dest = installer_paths
-                .resolve_relative(&p.name, p.package_type.as_deref())
-                .unwrap_or_else(|| format!("vendor/{}", p.name));
-            println!("  - {} ({}) → {dest}", p.name, p.version);
-        }
-        success("Dry run complete");
-        return Ok(());
-    }
-
     if !args.ignore_platform_reqs {
         let mut platform = Platform::detect().context("detect PHP platform")?;
         platform.apply_config_platform(manifest.config.as_ref());
@@ -194,6 +185,17 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         }
     }
 
+    if args.dry_run {
+        for p in lock.packages_to_install(with_dev) {
+            let dest = installer_paths
+                .resolve_relative(&p.name, p.package_type.as_deref())
+                .unwrap_or_else(|| format!("vendor/{}", p.name));
+            println!("  - {} ({}) → {dest}", p.name, p.version);
+        }
+        success("Dry run complete");
+        return Ok(());
+    }
+
     warn_unapproved_plugins(&lock, &manifest, with_dev);
 
     lock.save(&lock_path)?;
@@ -206,6 +208,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         .with_project_root(&cwd)
         .with_installer_paths(installer_paths.clone())
         .with_prefer_dist(prefer_dist)
+        .with_secure_http(manifest.secure_http())
         .with_auth(auth);
     let packages = composer_resolver::locked_list(&lock, with_dev);
     let refs: Vec<_> = packages.iter().collect();

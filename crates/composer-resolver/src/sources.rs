@@ -90,6 +90,7 @@ impl LocalPathPackage {
             suggest: BTreeMap::new(),
             bin: self.bin.clone(),
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -156,11 +157,42 @@ fn checkout_vcs(url: &str) -> Result<LocalPathPackage> {
     let hash = blake3::hash(url.as_bytes());
     let dest = cache.join(hash.to_hex().as_str());
 
-    if dest.join(".git").is_dir() {
-        // fetch latest
-        let _ = Command::new("git")
+    let marker = dest.join(".composer-rs-vcs-complete");
+    let git_ok = dest.join(".git").is_dir();
+    if git_ok && marker.is_file() {
+        let status = Command::new("git")
             .args(["-C", &dest.to_string_lossy(), "fetch", "--tags", "--force"])
-            .status();
+            .status()
+            .map_err(|e| Error::other(format!("git fetch failed to start: {e}")))?;
+        if !status.success() {
+            return Err(Error::other(format!("git fetch failed for {url}")));
+        }
+        let reset = Command::new("git")
+            .args([
+                "-C",
+                &dest.to_string_lossy(),
+                "reset",
+                "--hard",
+                "FETCH_HEAD",
+            ])
+            .status()
+            .map_err(|e| Error::other(format!("git reset failed to start: {e}")))?;
+        if !reset.success() {
+            // FETCH_HEAD may be missing on a no-op fetch; try origin/HEAD.
+            let reset = Command::new("git")
+                .args([
+                    "-C",
+                    &dest.to_string_lossy(),
+                    "reset",
+                    "--hard",
+                    "origin/HEAD",
+                ])
+                .status()
+                .map_err(|e| Error::other(format!("git reset failed to start: {e}")))?;
+            if !reset.success() {
+                return Err(Error::other(format!("git reset failed for {url}")));
+            }
+        }
     } else {
         if dest.exists() {
             std::fs::remove_dir_all(&dest).map_err(|e| Error::io(&dest, e))?;
@@ -172,6 +204,7 @@ fn checkout_vcs(url: &str) -> Result<LocalPathPackage> {
         if !status.success() {
             return Err(Error::other(format!("git clone failed for {url}")));
         }
+        std::fs::write(&marker, url.as_bytes()).map_err(|e| Error::io(&marker, e))?;
     }
 
     let head = Command::new("git")

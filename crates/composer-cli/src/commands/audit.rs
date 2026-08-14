@@ -66,6 +66,7 @@ pub async fn run(args: AuditArgs) -> Result<()> {
     // Packagist security advisories API (batch by name).
     let client = reqwest::Client::new();
     let mut findings = Vec::new();
+    let mut check_errors = Vec::new();
 
     // API: POST https://packagist.org/api/security-advisories/ with packages[]=
     // Also supports GET with query — use documented endpoint.
@@ -83,16 +84,19 @@ pub async fn run(args: AuditArgs) -> Result<()> {
         let resp = client.get(url).send().await;
         let Ok(resp) = resp else {
             warning("Could not reach packagist security API");
+            check_errors.push("security advisory service unreachable".into());
             continue;
         };
         if !resp.status().is_success() {
             warning(&format!("security API HTTP {}", resp.status()));
+            check_errors.push(format!("security API HTTP {}", resp.status()));
             continue;
         }
         let body: AdvisoriesResponse = match resp.json().await {
             Ok(b) => b,
             Err(e) => {
                 warning(&format!("parse advisories: {e}"));
+                check_errors.push(format!("parse advisories: {e}"));
                 continue;
             }
         };
@@ -120,6 +124,14 @@ pub async fn run(args: AuditArgs) -> Result<()> {
                 }
             }
         }
+    }
+
+    if !check_errors.is_empty() && findings.is_empty() {
+        bail!(
+            "security audit did not complete ({}): {}",
+            check_errors.len(),
+            check_errors.join("; ")
+        );
     }
 
     if args.format == "json" {

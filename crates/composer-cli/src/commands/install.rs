@@ -75,13 +75,15 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     let with_dev = !args.no_dev;
     let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
 
-    run_lifecycle(
-        &manifest,
-        ScriptEvent::PreInstallCmd,
-        &cwd,
-        args.no_scripts,
-        with_dev,
-    )?;
+    if !args.dry_run {
+        run_lifecycle(
+            &manifest,
+            ScriptEvent::PreInstallCmd,
+            &cwd,
+            args.no_scripts,
+            with_dev,
+        )?;
+    }
 
     let lock = if lock_path.exists() {
         info(&format!("Lock file: {}", lock_path.display()));
@@ -118,6 +120,19 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         lock
     };
 
+    let missing =
+        lock.unsatisfied_root_requirements(&manifest.require, &manifest.require_dev, with_dev);
+    if !missing.is_empty() {
+        let detail = missing
+            .iter()
+            .map(|(n, c)| format!("{n} ({c})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "composer.lock is missing current root requirement(s): {detail} — run `composer-rs update`"
+        );
+    }
+
     let packages = locked_list(&lock, with_dev);
     let installer_paths = manifest.installer_paths();
     if manifest
@@ -132,17 +147,6 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         "{} package(s) to install  ·  concurrency={concurrency}",
         packages.len()
     ));
-
-    if args.dry_run {
-        for p in &packages {
-            let dest = installer_paths
-                .resolve_relative(&p.name, p.package_type.as_deref())
-                .unwrap_or_else(|| format!("vendor/{}", p.name));
-            println!("  - {} ({}) → {dest}", p.name, p.version);
-        }
-        success("Dry run complete (no changes)");
-        return Ok(());
-    }
 
     if !args.ignore_platform_reqs {
         let mut platform = Platform::detect().context("detect PHP platform")?;
@@ -165,6 +169,17 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         }
     }
 
+    if args.dry_run {
+        for p in &packages {
+            let dest = installer_paths
+                .resolve_relative(&p.name, p.package_type.as_deref())
+                .unwrap_or_else(|| format!("vendor/{}", p.name));
+            println!("  - {} ({}) → {dest}", p.name, p.version);
+        }
+        success("Dry run complete (no changes)");
+        return Ok(());
+    }
+
     warn_unapproved_plugins(&lock, &manifest, with_dev);
 
     std::fs::create_dir_all(&vendor)?;
@@ -174,6 +189,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         .with_project_root(&cwd)
         .with_installer_paths(installer_paths.clone())
         .with_prefer_dist(prefer_dist)
+        .with_secure_http(manifest.secure_http())
         .with_auth(auth);
     let refs: Vec<&composer_lock::LockedPackage> = packages.iter().collect();
     installer

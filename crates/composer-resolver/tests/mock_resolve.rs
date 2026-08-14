@@ -105,6 +105,7 @@ fn locked_full(
         suggest: BTreeMap::new(),
         bin: vec![],
         abandoned: None,
+        unknown: BTreeMap::new(),
     }
 }
 
@@ -155,7 +156,8 @@ fn app_manifest(server: &str, require: &str) -> String {
                 "packagist.org": false
             }},
             "config": {{
-                "platform": {{ "php": "8.2.0" }}
+                "platform": {{ "php": "8.2.0" }},
+                "secure-http": false
             }}
         }}"#
     )
@@ -176,7 +178,8 @@ fn app_manifest_require_dev(server: &str, require_dev: &str) -> String {
                 "packagist.org": false
             }},
             "config": {{
-                "platform": {{ "php": "8.2.0" }}
+                "platform": {{ "php": "8.2.0" }},
+                "secure-http": false
             }}
         }}"#
     )
@@ -623,7 +626,8 @@ async fn resolve_uses_project_auth_json() {
                 "packagist.org": false
             }},
             "config": {{
-                "platform": {{ "php": "8.2.0" }}
+                "platform": {{ "php": "8.2.0" }},
+                "secure-http": false
             }}
         }}"#,
         server.uri()

@@ -357,6 +357,12 @@ fn match_single(clause: &str, version: &ComposerVersion) -> bool {
     if let Some(rest) = c.strip_prefix("!=") {
         return !versions_equal(version, rest);
     }
+    if let Some(rest) = c.strip_prefix("<>") {
+        return !versions_equal(version, rest);
+    }
+    if let Some(rest) = c.strip_prefix("==") {
+        return versions_equal(version, rest);
+    }
     if let Some(rest) = c.strip_prefix('>') {
         return cmp_gt(version, rest);
     }

@@ -1,11 +1,17 @@
 //! `composer-rs create-project`
 
-use super::{format_duration, header, info, success, warning};
+use super::{format_duration, header, info, success, vendor_dir};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use composer_auth::AuthStore;
-use composer_download::{PackageInstaller, default_concurrency, install_bins};
+use composer_core::{PackageId, VersionConstraint};
+use composer_download::{
+    PackageInstaller, default_concurrency, extract_archive, install_bins,
+    promote_extracted_package_root,
+};
+use composer_lock::ComposerLock;
 use composer_manifest::ComposerJson;
+use composer_repo::RepositoryRegistry;
 use composer_resolver::{ResolveOptions, locked_list, resolve};
 use composer_scripts::{ScriptEvent, run_event};
 use std::path::PathBuf;
@@ -50,22 +56,45 @@ pub async fn run(args: CreateProjectArgs) -> Result<()> {
     std::fs::create_dir_all(&dir_name)?;
 
     let version = args.version.as_deref().unwrap_or("*");
-    // Minimal composer.json requiring the package, then resolve & install into dir.
-    let mut require = serde_json::Map::new();
-    require.insert("php".into(), serde_json::json!(">=8.0"));
-    require.insert(args.package.clone(), serde_json::json!(version));
-    let manifest_json = serde_json::json!({
-        "name": "created-project/root",
-        "require": require,
-        "config": {
-            "platform": { "php": "8.2.0" }
-        }
-    });
+    let id = PackageId::parse(&args.package).context("invalid package name")?;
+    let constraint = VersionConstraint::new(version);
+    let auth = AuthStore::load(None).unwrap_or_default();
+    let bootstrap = ComposerJson::from_str("{}").context("empty manifest")?;
+    let registry = RepositoryRegistry::from_manifest_auth(&bootstrap, auth.clone())
+        .context("repository setup")?;
+    let remote = registry
+        .find_best(&id, &constraint, true, "stable")
+        .await
+        .with_context(|| format!("find project package {}", args.package))?;
+    let locked = remote.to_locked();
+    if locked.dist_url().is_none() {
+        bail!(
+            "package {} has no dist URL; create-project requires a downloadable archive",
+            args.package
+        );
+    }
+
+    let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
+    let installer = PackageInstaller::new(concurrency, false)?.with_auth(auth);
+    let archive = installer
+        .download_dist_archive(&locked)
+        .await
+        .context("download project package")?;
+    extract_archive(&archive, &dir_name).context("extract project package")?;
+    promote_extracted_package_root(&dir_name).context("unwrap package archive root")?;
+
     let json_path = dir_name.join("composer.json");
-    std::fs::write(
-        &dir_name.join("composer.json"),
-        serde_json::to_string_pretty(&manifest_json)? + "\n",
-    )?;
+    if !json_path.is_file() {
+        bail!(
+            "extracted package {} has no composer.json in {}",
+            args.package,
+            dir_name.display()
+        );
+    }
+    info(&format!(
+        "Created project from {} ({})",
+        locked.name, locked.version
+    ));
 
     if args.no_install {
         success(&format!("Created {} (no-install)", dir_name.display()));
@@ -75,67 +104,57 @@ pub async fn run(args: CreateProjectArgs) -> Result<()> {
     let composer_json_bytes =
         std::fs::read(&json_path).with_context(|| format!("read {}", json_path.display()))?;
     let manifest = ComposerJson::from_str(std::str::from_utf8(&composer_json_bytes)?)
-        .context("parse composer.json")?;
-    let concurrency = args.concurrency.unwrap_or_else(default_concurrency);
-    let options = ResolveOptions {
-        with_dev: true,
-        prefer_stable: true,
-        prefer_lowest: false,
-        minimum_stability: "stable".into(),
-        concurrency,
-        ignore_platform_reqs: args.ignore_platform_reqs,
-        ignore_platform_req: Vec::new(),
-        packages_to_update: Vec::new(),
-        update_deps: Default::default(),
+        .context("parse project composer.json")?;
+    let lock_path = dir_name.join("composer.lock");
+    let lock = if lock_path.is_file() {
+        info("Using lock file shipped with the project package");
+        ComposerLock::load(&lock_path).context("parse project composer.lock")?
+    } else {
+        let options = ResolveOptions {
+            with_dev: true,
+            prefer_stable: true,
+            prefer_lowest: false,
+            minimum_stability: manifest.minimum_stability().to_string(),
+            concurrency,
+            ignore_platform_reqs: args.ignore_platform_reqs,
+            ignore_platform_req: Vec::new(),
+            packages_to_update: Vec::new(),
+            update_deps: Default::default(),
+        };
+        let resolution = resolve(&manifest, &options, &dir_name, None)
+            .await
+            .context("resolve project dependencies")?;
+        let lock = resolution.to_lock(&manifest, &composer_json_bytes);
+        lock.save(&lock_path)?;
+        success(&format!("Wrote {}", lock_path.display()));
+        lock
     };
-    let resolution = resolve(&manifest, &options, &dir_name, None)
-        .await
-        .context("resolve project package")?;
-    let lock = resolution.to_lock(&manifest, &composer_json_bytes);
-    lock.save(&dir_name.join("composer.lock"))?;
 
-    let vendor = dir_name.join(manifest.vendor_dir());
+    let vendor = vendor_dir(&manifest, &dir_name);
     std::fs::create_dir_all(&vendor)?;
-    let auth = AuthStore::load(Some(&dir_name)).unwrap_or_default();
+    let project_auth = AuthStore::load(Some(&dir_name)).unwrap_or_default();
     let installer = PackageInstaller::new(concurrency, false)?
         .with_project_root(&dir_name)
         .with_installer_paths(manifest.installer_paths())
-        .with_auth(auth);
+        .with_secure_http(manifest.secure_http())
+        .with_auth(project_auth);
     let packages = locked_list(&lock, true);
     let refs: Vec<_> = packages.iter().collect();
-    installer.install_all(&refs, &vendor).await?;
+    installer
+        .install_all(&refs, &vendor)
+        .await
+        .context("install project dependencies")?;
     super::warn_copy_install(installer.stats().snapshot().copies);
 
     let bin_dir = dir_name.join(manifest.bin_dir());
-    let _ = install_bins(
+    install_bins(
         &refs,
         &vendor,
         &dir_name,
         &bin_dir,
         &manifest.installer_paths(),
-    );
-
-    // type:project packages become the project root (Composer create-project semantics).
-    if let Some(pkg) = lock.find(&args.package) {
-        if pkg.package_type.as_deref() == Some("project") {
-            let src = vendor.join(&pkg.name);
-            if src.is_dir() {
-                info(&format!(
-                    "Unpacking project package {} into {}",
-                    pkg.name,
-                    dir_name.display()
-                ));
-                copy_project_root(&src, &dir_name)?;
-                // Prefer the project's own composer.json / lock after unpack when present.
-                if dir_name.join("composer.json").is_file() {
-                    info("Using project package composer.json as root");
-                }
-            }
-        }
-    }
-
-    // Reload manifest if unpack replaced composer.json
-    let manifest = ComposerJson::load(&dir_name.join("composer.json")).unwrap_or(manifest);
+    )
+    .context("install package binaries")?;
 
     composer_autoload::generate(
         &dir_name,
@@ -150,7 +169,8 @@ pub async fn run(args: CreateProjectArgs) -> Result<()> {
     )?;
 
     if !args.no_scripts {
-        let _ = run_event(&manifest, ScriptEvent::PostInstallCmd, &dir_name, true);
+        run_event(&manifest, ScriptEvent::PostInstallCmd, &dir_name, true)
+            .context("post-install-cmd")?;
     }
 
     success(&format!(
@@ -158,39 +178,5 @@ pub async fn run(args: CreateProjectArgs) -> Result<()> {
         dir_name.display(),
         format_duration(start.elapsed())
     ));
-    let _ = warning;
-    Ok(())
-}
-
-/// Copy project package files into the target directory (does not wipe existing vendor/).
-fn copy_project_root(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
-    for entry in walkdir::WalkDir::new(src)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        // Keep our installed vendor/ tree
-        if rel
-            .components()
-            .next()
-            .is_some_and(|c| c.as_os_str() == "vendor")
-        {
-            continue;
-        }
-        let target = dest.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(entry.path(), &target).with_context(|| {
-                format!("copy {} → {}", entry.path().display(), target.display())
-            })?;
-        }
-    }
     Ok(())
 }

@@ -4,6 +4,7 @@ use crate::AHashSet;
 use crate::error::{Error, Result};
 use crate::version::{ComposerVersion, VersionConstraint};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::process::Command;
 
 /// Detected PHP platform (version + loaded extensions).
@@ -11,6 +12,8 @@ use std::process::Command;
 pub struct Platform {
     pub php: ComposerVersion,
     extensions: AHashSet<String>,
+    /// Detected or configured extension versions. Missing means "loaded, version unknown".
+    ext_versions: BTreeMap<String, ComposerVersion>,
     /// True when PHP was probed successfully or overridden via env/`config.platform`.
     /// When false, platform checks should not pretend requirements are satisfied.
     pub reliable: bool,
@@ -38,16 +41,25 @@ impl Platform {
             ComposerVersion::parse("0.0.0").expect("0.0.0 parses")
         };
 
-        let mut extensions = if reliable {
+        let (mut extensions, mut ext_versions) = if reliable {
             detect_php_extensions().unwrap_or_default()
         } else {
-            AHashSet::new()
+            (AHashSet::new(), BTreeMap::new())
         };
 
         for (key, val) in std::env::vars() {
             if let Some(ext) = key.strip_prefix("COMPOSER_PLATFORM_EXT_") {
                 if val == "1" || val.eq_ignore_ascii_case("true") {
                     extensions.insert(ext.to_ascii_lowercase().replace('_', "-"));
+                    reliable = true;
+                } else if val == "0" || val.eq_ignore_ascii_case("false") {
+                    let name = ext.to_ascii_lowercase().replace('_', "-");
+                    extensions.remove(&name);
+                    ext_versions.remove(&name);
+                } else if let Ok(ver) = ComposerVersion::parse(&val) {
+                    let name = ext.to_ascii_lowercase().replace('_', "-");
+                    extensions.insert(name.clone());
+                    ext_versions.insert(name, ver);
                     reliable = true;
                 }
             }
@@ -56,6 +68,7 @@ impl Platform {
         Ok(Self {
             php,
             extensions,
+            ext_versions,
             reliable,
         })
     }
@@ -70,9 +83,24 @@ impl Platform {
         };
 
         for (name, val) in platform {
+            if val.as_bool() == Some(false) {
+                if let Some(ext) = name.strip_prefix("ext-") {
+                    let ext = ext.to_ascii_lowercase();
+                    self.extensions.remove(&ext);
+                    self.ext_versions.remove(&ext);
+                }
+                continue;
+            }
+
             let version = match val {
                 Value::String(s) => s.as_str(),
-                Value::Bool(false) => continue,
+                Value::Bool(true) => {
+                    if let Some(ext) = name.strip_prefix("ext-") {
+                        self.extensions.insert(ext.to_ascii_lowercase());
+                        self.reliable = true;
+                    }
+                    continue;
+                }
                 Value::Number(n) => {
                     // uncommon but allow
                     let owned = n.to_string();
@@ -81,6 +109,13 @@ impl Platform {
                             self.php = v;
                             self.reliable = true;
                         }
+                    } else if let Some(ext) = name.strip_prefix("ext-") {
+                        let ext = ext.to_ascii_lowercase();
+                        self.extensions.insert(ext.clone());
+                        if let Ok(v) = ComposerVersion::parse(&owned) {
+                            self.ext_versions.insert(ext, v);
+                        }
+                        self.reliable = true;
                     }
                     continue;
                 }
@@ -93,11 +128,12 @@ impl Platform {
                     self.reliable = true;
                 }
             } else if let Some(ext) = name.strip_prefix("ext-") {
-                // Any non-false value means the extension is available.
-                if val.as_bool() != Some(false) {
-                    self.extensions.insert(ext.to_ascii_lowercase());
-                    self.reliable = true;
+                let ext = ext.to_ascii_lowercase();
+                self.extensions.insert(ext.clone());
+                if let Ok(v) = ComposerVersion::parse(version) {
+                    self.ext_versions.insert(ext, v);
                 }
+                self.reliable = true;
             }
         }
     }
@@ -129,9 +165,16 @@ impl Platform {
         if !self.extensions.contains(&normalized) {
             return false;
         }
-        // Composer rarely pins ext versions; `*` / `1` mean "loaded".
-        let _ = constraint;
-        true
+        let constraint = constraint.trim();
+        // Composer: `*`, empty, `0`, and `1` mean "the extension is loaded".
+        if constraint.is_empty() || matches!(constraint, "*" | "0" | "1") {
+            return true;
+        }
+        if let Some(ver) = self.ext_versions.get(&normalized) {
+            return VersionConstraint::new(constraint).matches(ver);
+        }
+        // Loaded but version unknown: do not claim a version pin is satisfied.
+        false
     }
 
     pub fn php_version(&self) -> &ComposerVersion {
@@ -143,6 +186,7 @@ impl Platform {
         Ok(Self {
             php: ComposerVersion::parse(php)?,
             extensions: AHashSet::new(),
+            ext_versions: BTreeMap::new(),
             reliable: true,
         })
     }
@@ -157,6 +201,7 @@ impl Platform {
                 .into_iter()
                 .map(|e| e.as_ref().to_ascii_lowercase())
                 .collect(),
+            ext_versions: BTreeMap::new(),
             reliable: true,
         })
     }
@@ -244,7 +289,20 @@ fn detect_php_version() -> Option<ComposerVersion> {
     ComposerVersion::parse(&version).ok()
 }
 
-fn detect_php_extensions() -> Option<AHashSet<String>> {
+fn detect_php_extensions() -> Option<(AHashSet<String>, BTreeMap<String, ComposerVersion>)> {
+    let script = "foreach (get_loaded_extensions() as $e) { \
+         $v = phpversion($e); \
+         echo strtolower($e), \"\\t\", ($v === false ? \"\" : $v), \"\\n\"; \
+     }";
+    if let Ok(output) = Command::new("php").args(["-r", script]).output() {
+        if output.status.success() {
+            let (exts, vers) = parse_extension_versions(&String::from_utf8_lossy(&output.stdout));
+            if !exts.is_empty() {
+                return Some((exts, vers));
+            }
+        }
+    }
+
     let output = Command::new("php").args(["-m"]).output().ok()?;
     if !output.status.success() {
         return None;
@@ -272,7 +330,32 @@ fn detect_php_extensions() -> Option<AHashSet<String>> {
             exts.insert(line.to_ascii_lowercase());
         }
     }
-    Some(exts)
+    Some((exts, BTreeMap::new()))
+}
+
+fn parse_extension_versions(text: &str) -> (AHashSet<String>, BTreeMap<String, ComposerVersion>) {
+    let mut exts = AHashSet::new();
+    let mut vers = BTreeMap::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        exts.insert(name.clone());
+        if let Some(raw) = parts.next() {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                if let Ok(ver) = ComposerVersion::parse(raw) {
+                    vers.insert(name, ver);
+                }
+            }
+        }
+    }
+    (exts, vers)
 }
 
 #[cfg(test)]
@@ -284,6 +367,7 @@ mod tests {
         let platform = Platform {
             php: ComposerVersion::parse("8.2.0").unwrap(),
             extensions: AHashSet::from_iter(["json".into()]),
+            ext_versions: BTreeMap::new(),
             reliable: true,
         };
         assert!(platform.satisfies("php", ">=8.1"));
@@ -307,6 +391,7 @@ mod tests {
         let platform = Platform {
             php: ComposerVersion::parse("0.0.0").unwrap(),
             extensions: AHashSet::new(),
+            ext_versions: BTreeMap::new(),
             reliable: false,
         };
         assert!(!platform.satisfies("php", ">=7.0"));
@@ -320,6 +405,7 @@ mod tests {
         let mut platform = Platform {
             php: ComposerVersion::parse("0.0.0").unwrap(),
             extensions: AHashSet::new(),
+            ext_versions: BTreeMap::new(),
             reliable: false,
         };
         let config = serde_json::json!({
@@ -332,5 +418,39 @@ mod tests {
         assert!(platform.reliable);
         assert!(platform.satisfies("php", ">=8.1"));
         assert!(platform.satisfies("ext-json", "*"));
+    }
+
+    #[test]
+    fn config_platform_false_disables_loaded_extension() {
+        let mut platform = Platform {
+            php: ComposerVersion::parse("8.2.0").unwrap(),
+            extensions: AHashSet::from_iter(["json".into()]),
+            ext_versions: BTreeMap::from([(
+                "json".into(),
+                ComposerVersion::parse("8.2.0").unwrap(),
+            )]),
+            reliable: true,
+        };
+        let config = serde_json::json!({ "platform": { "ext-json": false } });
+        platform.apply_config_platform(Some(&config));
+        assert!(!platform.satisfies("ext-json", "*"));
+    }
+
+    #[test]
+    fn extension_version_constraint_is_checked() {
+        let mut platform = Platform {
+            php: ComposerVersion::parse("8.2.0").unwrap(),
+            extensions: AHashSet::from_iter(["json".into()]),
+            ext_versions: BTreeMap::from([(
+                "json".into(),
+                ComposerVersion::parse("8.2.0").unwrap(),
+            )]),
+            reliable: true,
+        };
+        assert!(platform.satisfies("ext-json", ">=8.0"));
+        assert!(!platform.satisfies("ext-json", ">=999"));
+        platform.ext_versions.clear();
+        assert!(platform.satisfies("ext-json", "*"));
+        assert!(!platform.satisfies("ext-json", ">=999"));
     }
 }

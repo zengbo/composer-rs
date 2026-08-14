@@ -69,13 +69,44 @@ pub fn generate(
 
     // Locked packages (PSR / classmap). `files` are collected separately so
     // they can be ordered dependencies-first like Composer\Util\PackageSorter.
+    let installer_paths = manifest.installer_paths();
     if let Some(lock) = lock {
         for pkg in lock.packages_to_install(options.with_dev) {
-            collect_package_autoload(pkg, &mut psr4, &mut psr0, &mut classmap_dirs)?;
+            collect_package_autoload(
+                pkg,
+                project_root,
+                vendor_dir,
+                &installer_paths,
+                &mut psr4,
+                &mut psr0,
+                &mut classmap_dirs,
+            )?;
         }
         let pkgs = lock.packages_to_install(options.with_dev);
         for pkg in sort_packages_by_dependency_weight(&pkgs) {
-            append_files(&mut files, pkg.autoload.as_ref(), &pkg.name, false);
+            if installer_paths
+                .resolve_relative(&pkg.name, pkg.package_type.as_deref())
+                .is_some()
+            {
+                let custom = installer_paths.install_path_from_composer(
+                    &pkg.name,
+                    pkg.package_type.as_deref(),
+                    project_root,
+                    vendor_dir,
+                );
+                if let Some(al) = &pkg.autoload {
+                    for f in &al.files {
+                        let rel = f.trim_start_matches("./");
+                        files.push(if rel.is_empty() || rel == "." {
+                            custom.clone()
+                        } else {
+                            format!("{}/{}", custom.trim_end_matches('/'), rel)
+                        });
+                    }
+                }
+            } else {
+                append_files(&mut files, pkg.autoload.as_ref(), &pkg.name, false);
+            }
         }
     }
 
@@ -95,7 +126,7 @@ pub fn generate(
             let abs = resolve_autoload_path(vendor_dir, dir);
             scan_classmap(&abs, vendor_dir, &mut classmap)?;
         }
-        if options.optimize {
+        if options.optimize || options.classmap_authoritative {
             for (prefix, paths) in &psr4 {
                 for p in paths {
                     let abs = resolve_autoload_path(vendor_dir, p);
@@ -136,8 +167,23 @@ pub fn generate(
         options.classmap_authoritative,
         options.optimize,
     )?;
-    write_installed(&autoload_dir, lock, options.with_dev)?;
-    write_installed_php(&autoload_dir, manifest, lock, options.with_dev)?;
+    write_installed(
+        &autoload_dir,
+        lock,
+        options.with_dev,
+        project_root,
+        vendor_dir,
+        &installer_paths,
+    )?;
+    write_installed_php(
+        &autoload_dir,
+        manifest,
+        lock,
+        options.with_dev,
+        project_root,
+        vendor_dir,
+        &installer_paths,
+    )?;
     write_platform_check(&autoload_dir, manifest, lock)?;
 
     // vendor/autoload.php
@@ -266,15 +312,87 @@ fn package_path(package_install: &str, path: &str, is_root: bool) -> String {
 
 fn collect_package_autoload(
     pkg: &LockedPackage,
+    project_root: &Path,
+    vendor_dir: &Path,
+    installer_paths: &composer_manifest::InstallerPaths,
     psr4: &mut BTreeMap<String, Vec<String>>,
     psr0: &mut BTreeMap<String, Vec<String>>,
     classmap_dirs: &mut Vec<String>,
 ) -> Result<()> {
-    let install = pkg.name.clone(); // vendor/name
+    let install = installer_paths.install_path_from_composer(
+        &pkg.name,
+        pkg.package_type.as_deref(),
+        project_root,
+        vendor_dir,
+    );
+    // merge_autoload prefixes with package_path(package_install, path, is_root)
+    // which expects a vendor-relative name for default installs (`../name`).
+    // Custom installer paths are already relative to vendor/composer, so pass
+    // them as the install root with an empty relative file path.
+    let install_for_merge = install
+        .strip_prefix("../")
+        .unwrap_or(install.as_str())
+        .to_string();
     if let Some(al) = &pkg.autoload {
-        merge_autoload(al, &install, false, psr4, psr0, classmap_dirs);
+        if installer_paths
+            .resolve_relative(&pkg.name, pkg.package_type.as_deref())
+            .is_some()
+        {
+            merge_autoload_at(al, &install, psr4, psr0, classmap_dirs);
+        } else {
+            merge_autoload(al, &install_for_merge, false, psr4, psr0, classmap_dirs);
+        }
     }
     Ok(())
+}
+
+fn merge_autoload_at(
+    al: &AutoloadConfig,
+    install_from_composer: &str,
+    psr4: &mut BTreeMap<String, Vec<String>>,
+    psr0: &mut BTreeMap<String, Vec<String>>,
+    classmap_dirs: &mut Vec<String>,
+) {
+    for (prefix, paths) in &al.psr4 {
+        for p in paths.paths() {
+            let dest = if p.is_empty() || p == "." {
+                install_from_composer.to_string()
+            } else {
+                format!(
+                    "{}/{}",
+                    install_from_composer.trim_end_matches('/'),
+                    p.trim_start_matches("./")
+                )
+            };
+            psr4.entry(prefix.clone()).or_default().push(dest);
+        }
+    }
+    for (prefix, paths) in &al.psr0 {
+        for p in paths.paths() {
+            let dest = if p.is_empty() || p == "." {
+                install_from_composer.to_string()
+            } else {
+                format!(
+                    "{}/{}",
+                    install_from_composer.trim_end_matches('/'),
+                    p.trim_start_matches("./")
+                )
+            };
+            psr0.entry(prefix.clone()).or_default().push(dest);
+        }
+    }
+    for dir in &al.classmap {
+        let dest = if dir.is_empty() || dir == "." {
+            install_from_composer.to_string()
+        } else {
+            format!(
+                "{}/{}",
+                install_from_composer.trim_end_matches('/'),
+                dir.trim_start_matches("./")
+            )
+        };
+        classmap_dirs.push(dest);
+    }
 }
 
 fn resolve_autoload_path(vendor_dir: &Path, rel_from_composer: &str) -> PathBuf {
@@ -806,10 +924,17 @@ class ComposerAutoloaderInit
     fs::write(&path, body).map_err(|e| Error::io(&path, e))
 }
 
-fn write_installed(dir: &Path, lock: Option<&ComposerLock>, with_dev: bool) -> Result<()> {
+fn write_installed(
+    dir: &Path,
+    lock: Option<&ComposerLock>,
+    with_dev: bool,
+    project_root: &Path,
+    vendor_dir: &Path,
+    installer_paths: &composer_manifest::InstallerPaths,
+) -> Result<()> {
     let path = dir.join("installed.json");
     let packages = lock
-        .map(|l| installed_packages_json(l, with_dev))
+        .map(|l| installed_packages_json_at(l, with_dev, project_root, vendor_dir, installer_paths))
         .unwrap_or_default();
 
     let doc = serde_json::json!({
@@ -826,10 +951,31 @@ fn write_installed(dir: &Path, lock: Option<&ComposerLock>, with_dev: bool) -> R
 
 /// Build Composer 2-style package entries for `vendor/composer/installed.json`.
 pub fn installed_packages_json(lock: &ComposerLock, with_dev: bool) -> Vec<serde_json::Value> {
+    installed_packages_json_at(
+        lock,
+        with_dev,
+        Path::new("."),
+        Path::new("vendor"),
+        &composer_manifest::InstallerPaths::default(),
+    )
+}
+
+fn installed_packages_json_at(
+    lock: &ComposerLock,
+    with_dev: bool,
+    project_root: &Path,
+    vendor_dir: &Path,
+    installer_paths: &composer_manifest::InstallerPaths,
+) -> Vec<serde_json::Value> {
     lock.packages_to_install(with_dev)
         .into_iter()
         .filter_map(|p| {
-            let name = p.name.clone();
+            let install = installer_paths.install_path_from_composer(
+                &p.name,
+                p.package_type.as_deref(),
+                project_root,
+                vendor_dir,
+            );
             let mut v = serde_json::to_value(p).ok()?;
             if let Some(obj) = v.as_object_mut() {
                 let ver = obj
@@ -841,11 +987,7 @@ pub fn installed_packages_json(lock: &ComposerLock, with_dev: bool) -> Vec<serde
                     "version_normalized".into(),
                     serde_json::Value::String(composer_core::version_normalized(&ver)),
                 );
-                // Relative to vendor/composer/
-                obj.insert(
-                    "install-path".into(),
-                    serde_json::Value::String(format!("../{name}")),
-                );
+                obj.insert("install-path".into(), serde_json::Value::String(install));
             }
             Some(v)
         })
@@ -857,6 +999,9 @@ fn write_installed_php(
     manifest: &ComposerJson,
     lock: Option<&ComposerLock>,
     with_dev: bool,
+    project_root: &Path,
+    vendor_dir: &Path,
+    installer_paths: &composer_manifest::InstallerPaths,
 ) -> Result<()> {
     let path = dir.join("installed.php");
     let root_name = manifest.name.as_deref().unwrap_or("__root__");
@@ -881,13 +1026,20 @@ fn write_installed_php(
             } else {
                 "false"
             };
+            let install = installer_paths.install_path_from_composer(
+                &p.name,
+                p.package_type.as_deref(),
+                project_root,
+                vendor_dir,
+            );
             versions.push_str(&format!(
-                "        '{name}' => array(\n            'pretty_version' => '{pretty}',\n            'version' => '{version}',\n            'reference' => {reference},\n            'type' => '{ty}',\n            'install_path' => __DIR__ . '/../{name}',\n            'aliases' => array(),\n            'dev_requirement' => {dev_req},\n        ),\n",
+                "        '{name}' => array(\n            'pretty_version' => '{pretty}',\n            'version' => '{version}',\n            'reference' => {reference},\n            'type' => '{ty}',\n            'install_path' => __DIR__ . '/{install}',\n            'aliases' => array(),\n            'dev_requirement' => {dev_req},\n        ),\n",
                 name = escape_php(&p.name),
                 pretty = escape_php(&p.version),
                 version = escape_php(&normalized),
                 reference = php_optional_string(reference),
                 ty = escape_php(pkg_type),
+                install = escape_php(&install),
                 dev_req = dev_req,
             ));
         }
@@ -1106,6 +1258,7 @@ mod tests {
             suggest: BTreeMap::new(),
             bin: vec![],
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 
@@ -1538,5 +1691,110 @@ class DateTimeImmutable extends \DateTimeImmutable {}
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+
+    #[test]
+    fn classmap_authoritative_scans_psr4_without_optimize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendor = root.join("vendor");
+        let src = vendor.join("acme/lib/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("Example.php"),
+            "<?php\nnamespace Acme;\nclass Example {}\n",
+        )
+        .unwrap();
+        let mut pkg = locked("acme/lib", "1.0.0");
+        pkg.autoload = Some(AutoloadConfig {
+            psr4: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "Acme\\".into(),
+                    composer_core::PathOrPaths::One("src".into()),
+                );
+                m
+            },
+            ..Default::default()
+        });
+        let lock = ComposerLock {
+            packages: vec![pkg],
+            ..Default::default()
+        };
+        let manifest: ComposerJson = serde_json::from_value(serde_json::json!({
+            "name": "acme/app"
+        }))
+        .unwrap();
+        generate(
+            root,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions {
+                optimize: false,
+                classmap_authoritative: true,
+                with_dev: true,
+            },
+        )
+        .unwrap();
+        let classmap =
+            std::fs::read_to_string(vendor.join("composer/autoload_classmap.php")).unwrap();
+        assert!(
+            classmap.contains("'Acme\\\\Example'"),
+            "authoritative classmap must include PSR-4 classes:\n{classmap}"
+        );
+    }
+
+    #[test]
+    fn custom_installer_path_appears_in_installed_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendor = root.join("vendor");
+        let dest = root.join("wp-content/plugins/akismet");
+        std::fs::create_dir_all(dest.join("src")).unwrap();
+        std::fs::write(
+            dest.join("src/Plugin.php"),
+            "<?php\nnamespace Akismet;\nclass Plugin {}\n",
+        )
+        .unwrap();
+        let mut pkg = locked("vendor/akismet", "1.0.0");
+        pkg.package_type = Some("wordpress-plugin".into());
+        pkg.autoload = Some(AutoloadConfig {
+            psr4: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "Akismet\\".into(),
+                    composer_core::PathOrPaths::One("src".into()),
+                );
+                m
+            },
+            ..Default::default()
+        });
+        let lock = ComposerLock {
+            packages: vec![pkg],
+            ..Default::default()
+        };
+        let manifest: ComposerJson = serde_json::from_value(serde_json::json!({
+            "name": "acme/app"
+        }))
+        .unwrap();
+        generate(
+            root,
+            &vendor,
+            &manifest,
+            Some(&lock),
+            &AutoloadOptions::default(),
+        )
+        .unwrap();
+        let psr4 = std::fs::read_to_string(vendor.join("composer/autoload_psr4.php")).unwrap();
+        assert!(
+            psr4.contains("wp-content/plugins/akismet/src"),
+            "PSR-4 map must point at installer path:\n{psr4}"
+        );
+        let installed = std::fs::read_to_string(vendor.join("composer/installed.json")).unwrap();
+        assert!(
+            installed.contains("wp-content/plugins/akismet"),
+            "installed.json must record custom install-path:\n{installed}"
+        );
     }
 }

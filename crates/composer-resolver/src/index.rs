@@ -152,17 +152,19 @@ impl PackageIndex {
                 }
                 // Prefer a concrete version for the alias: use provider version when
                 // provide value is a constraint like `*` or `^1.0`.
-                let virtual_version = if virtual_constraint == "*"
-                    || virtual_constraint.is_empty()
-                    || virtual_constraint.starts_with('^')
-                    || virtual_constraint.starts_with('~')
-                    || virtual_constraint.starts_with('>')
-                    || virtual_constraint.starts_with('<')
-                    || virtual_constraint.contains('|')
+                let trimmed = virtual_constraint.trim();
+                let virtual_version = if trimmed == "self.version"
+                    || trimmed == "*"
+                    || trimmed.is_empty()
+                    || trimmed.starts_with('^')
+                    || trimmed.starts_with('~')
+                    || trimmed.starts_with('>')
+                    || trimmed.starts_with('<')
+                    || trimmed.contains('|')
                 {
                     iv.locked.version.clone()
                 } else {
-                    virtual_constraint.trim_start_matches('=').to_string()
+                    trimmed.trim_start_matches('=').to_string()
                 };
 
                 let mut locked = iv.locked.clone();
@@ -298,6 +300,7 @@ mod tests {
             suggest: BTreeMap::new(),
             bin: vec![],
             abandoned: None,
+            unknown: BTreeMap::new(),
         }
     }
 
@@ -317,6 +320,28 @@ mod tests {
         assert_eq!(
             index.real_provider_for("virtual/pkg", "2.0.0"),
             Some("vendor/impl-b")
+        );
+    }
+
+    #[test]
+    fn self_version_uses_provider_version() {
+        let mut index = PackageIndex::new();
+        let mut provider = pkg("acme/provider", "2.3.0", &[]);
+        provider
+            .replace
+            .insert("acme/virtual".into(), "self.version".into());
+        index.insert_locked(provider);
+        index.register_virtual_packages();
+
+        let versions: Vec<_> = index
+            .all_versions("acme/virtual")
+            .into_iter()
+            .map(|iv| iv.locked.version.as_str())
+            .collect();
+        assert_eq!(versions, vec!["2.3.0"]);
+        assert_eq!(
+            index.real_provider_for("acme/virtual", "2.3.0"),
+            Some("acme/provider")
         );
     }
 }

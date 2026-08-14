@@ -302,7 +302,7 @@ fn run_shell_line(
     let mut full = line.to_string();
     for a in extra_args {
         full.push(' ');
-        full.push_str(a);
+        full.push_str(&shell_quote(a));
     }
     debug!(cmd = %full, "exec script");
 
@@ -335,6 +335,14 @@ fn run_shell_line(
         )));
     }
     Ok(())
+}
+
+fn shell_quote(arg: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", arg.replace('"', "\"\""))
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }
 
 fn apply_script_env(cmd: &mut Command, project_root: &Path, dirs: &ScriptDirs, dev_mode: bool) {
@@ -415,6 +423,15 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn extra_args_are_shell_quoted() {
+        assert_eq!(
+            shell_quote("value; touch injected"),
+            "'value; touch injected'"
+        );
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     #[test]
@@ -542,6 +559,7 @@ mod tests {
                 suggest: BTreeMap::new(),
                 bin: vec![],
                 abandoned: None,
+                unknown: BTreeMap::new(),
             }
         }
 

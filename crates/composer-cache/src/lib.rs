@@ -11,10 +11,12 @@
 use composer_core::error::{Error, Result};
 use composer_core::hash::{ContentHash, content_hash};
 use dashmap::DashMap;
+use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
@@ -133,16 +135,34 @@ impl CasCache {
             fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
 
-        // Staging directory next to final destination
-        let staging = dest.with_extension("staging");
+        let lock_path = dest.with_extension("lock");
+        let _file_lock = acquire_exclusive_lock(&lock_path)?;
+
+        if self.marker_path(&hash).is_file() {
+            return Ok(dest);
+        }
+
+        // Unique staging dir so concurrent processes cannot delete each other.
+        let staging = dest.with_file_name(format!(
+            "{}.staging-{}-{}",
+            dest.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            unique_suffix()
+        ));
         if staging.exists() {
             fs::remove_dir_all(&staging).map_err(|e| Error::io(&staging, e))?;
         }
-        if dest.exists() {
-            fs::remove_dir_all(&dest).map_err(|e| Error::io(&dest, e))?;
-        }
 
         copy_dir_recursive(source_dir, &staging)?;
+        make_tree_readonly(&staging)?;
+
+        if dest.exists() && !self.marker_path(&hash).is_file() {
+            fs::remove_dir_all(&dest).map_err(|e| Error::io(&dest, e))?;
+        }
+        if dest.exists() && self.marker_path(&hash).is_file() {
+            let _ = fs::remove_dir_all(&staging);
+            return Ok(dest);
+        }
         fs::rename(&staging, &dest).map_err(|e| Error::io(&dest, e))?;
         fs::write(self.marker_path(&hash), key.as_bytes())
             .map_err(|e| Error::io(self.marker_path(&hash), e))?;
@@ -157,14 +177,46 @@ impl CasCache {
             .get(key)
             .ok_or_else(|| Error::Cache(format!("cache miss for key: {key}")))?;
 
-        if dest.exists() {
-            fs::remove_dir_all(dest).map_err(|e| Error::io(dest, e))?;
-        }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
 
-        let stats = link_dir_recursive(&cache_path, dest)?;
+        let tmp = dest.with_file_name(format!(
+            "{}.composer-rs-link-{}-{}",
+            dest.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            unique_suffix()
+        ));
+        if tmp.exists() {
+            fs::remove_dir_all(&tmp).map_err(|e| Error::io(&tmp, e))?;
+        }
+
+        let stats = match link_dir_recursive(&cache_path, &tmp) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+        };
+
+        if dest.exists() {
+            let bak = dest.with_file_name(format!(
+                "{}.composer-rs-old-{}-{}",
+                dest.file_name().unwrap_or_default().to_string_lossy(),
+                std::process::id(),
+                unique_suffix()
+            ));
+            fs::rename(dest, &bak).map_err(|e| Error::io(dest, e))?;
+            if let Err(e) = fs::rename(&tmp, dest) {
+                let _ = fs::rename(&bak, dest);
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(Error::io(dest, e));
+            }
+            let _ = fs::remove_dir_all(&bak);
+        } else if let Err(e) = fs::rename(&tmp, dest) {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(Error::io(dest, e));
+        }
         Ok(stats)
     }
 
@@ -269,7 +321,7 @@ impl CasCache {
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             let complete = path.join(".composer-rs-complete").is_file();
-            if name.ends_with(".staging") || !complete {
+            if name.contains(".staging") || !complete {
                 stats.leftover_removed += 1;
                 drop_cas_tree(&path, dry_run, stats)?;
                 continue;
@@ -509,6 +561,47 @@ fn remove_unreferenced_complete(
     Ok(true)
 }
 
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn acquire_exclusive_lock(path: &Path) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| Error::io(path, e))?;
+    file.lock_exclusive()
+        .map_err(|e| Error::Cache(format!("lock {}: {e}", path.display())))?;
+    Ok(file)
+}
+
+fn make_tree_readonly(path: &Path) -> Result<()> {
+    for entry in WalkDir::new(path) {
+        let entry = entry.map_err(|e| Error::Cache(e.to_string()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name() == ".composer-rs-complete" {
+            continue;
+        }
+        let meta = fs::metadata(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
+        let mut perms = meta.permissions();
+        if !perms.readonly() {
+            perms.set_readonly(true);
+            fs::set_permissions(entry.path(), perms).map_err(|e| Error::io(entry.path(), e))?;
+        }
+    }
+    Ok(())
+}
+
 fn remove_dir_if_empty(path: &Path) {
     if let Ok(mut entries) = fs::read_dir(path) {
         if entries.next().is_none() {
@@ -571,6 +664,37 @@ mod tests {
             assert_eq!(ino1, cas_ino);
             assert_eq!(ino2, cas_ino);
         }
+
+        let dest_file = vendor.join("hello.txt");
+        assert!(
+            fs::metadata(&dest_file).unwrap().permissions().readonly(),
+            "CAS-linked vendor files must be read-only"
+        );
+        assert!(fs::write(&dest_file, "mutated").is_err());
+        let cas_body = fs::read_to_string(cas.get("key-1").unwrap().join("hello.txt")).unwrap();
+        assert_eq!(cas_body, "world\n");
+    }
+
+    #[test]
+    fn vendor_write_cannot_mutate_cas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = CasCache::with_root(tmp.path().join("cas"));
+        let pkg = tmp.path().join("pkg");
+        write_pkg(&pkg, "original");
+        cas.store("immut", &pkg).unwrap();
+        let a = tmp.path().join("a/vendor/pkg");
+        let b = tmp.path().join("b/vendor/pkg");
+        cas.link_to("immut", &a).unwrap();
+        cas.link_to("immut", &b).unwrap();
+        assert!(fs::write(a.join("hello.txt"), "pwned").is_err());
+        assert_eq!(
+            fs::read_to_string(b.join("hello.txt")).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            fs::read_to_string(cas.get("immut").unwrap().join("hello.txt")).unwrap(),
+            "original\n"
+        );
     }
 
     fn write_pkg(dir: &Path, body: &str) {

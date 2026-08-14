@@ -96,6 +96,7 @@ async fn p2_fetch_sends_http_basic_credentials() {
         r#"{{
             "name": "acme/app",
             "require": {{ "php": ">=8.0", "acme/secret": "^1.0" }},
+            "config": {{ "secure-http": false }},
             "repositories": {{
                 "private": {{ "type": "composer", "url": "{}/" }},
                 "packagist.org": false
@@ -155,7 +156,9 @@ async fn search_sends_http_basic_credentials() {
         },
     );
 
-    let client = composer_repo::RepositoryClient::with_base_url_auth(server.uri(), auth).unwrap();
+    let client = composer_repo::RepositoryClient::with_base_url_auth(server.uri(), auth)
+        .unwrap()
+        .with_secure_http(false);
     let results = client.search("secret", 10).await.expect("search with auth");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "acme/secret");
@@ -186,6 +189,7 @@ async fn p2_fetch_without_auth_fails_on_protected_repo() {
         r#"{{
             "name": "acme/app",
             "require": {{ "acme/locked": "*" }},
+            "config": {{ "secure-http": false }},
             "repositories": {{
                 "private": {{ "type": "composer", "url": "{}/" }},
                 "packagist.org": false

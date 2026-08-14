@@ -85,7 +85,8 @@ async fn e2e_path_install_bins_and_post_autoload_script() {
     let installer = PackageInstaller::new(4, false)
         .unwrap()
         .with_project_root(&app)
-        .with_cache(CasCache::with_root(root.join("cache")));
+        .with_cache(CasCache::with_root(root.join("cache")))
+        .with_secure_http(false);
     let packages = composer_resolver::locked_list(&lock, false);
     let refs: Vec<_> = packages.iter().collect();
     installer

@@ -96,7 +96,8 @@ async fn resolve_and_install(app_dir: &Path, cache_dir: &Path) -> (ComposerLock,
     let installer = PackageInstaller::new(4, false)
         .expect("installer")
         .with_project_root(app_dir)
-        .with_cache(CasCache::with_root(cache_dir));
+        .with_cache(CasCache::with_root(cache_dir))
+        .with_secure_http(false);
 
     let packages = composer_resolver::locked_list(&lock, false);
     let refs: Vec<_> = packages.iter().collect();
@@ -269,7 +270,8 @@ async fn e2e_dist_zip_resolve_install() {
                 "packagist.org": false
             }},
             "config": {{
-                "platform": {{ "php": "8.2.0" }}
+                "platform": {{ "php": "8.2.0" }},
+                "secure-http": false
             }}
         }}"#,
         server.uri()
@@ -324,6 +326,7 @@ fn locked_dist(name: &str, url: &str, mirrors: Option<Vec<serde_json::Value>>) -
         suggest: BTreeMap::new(),
         bin: vec![],
         abandoned: None,
+        unknown: BTreeMap::new(),
     }
 }
 
@@ -359,6 +362,7 @@ async fn install_one_pkg_auth(
         .expect("installer")
         .with_project_root(app)
         .with_cache(CasCache::with_root(cache_dir))
+        .with_secure_http(false)
         .with_auth(auth);
     installer.install_all(&[pkg], &vendor).await
 }
@@ -523,7 +527,8 @@ async fn e2e_resolve_preserves_p2_mirrors_and_fails_over() {
                     "packagist.org": false
                 }},
                 "config": {{
-                    "platform": {{ "php": "8.2.0" }}
+                    "platform": {{ "php": "8.2.0" }},
+                    "secure-http": false
                 }}
             }}"#,
             server.uri()

@@ -74,6 +74,7 @@ url = { version = "2.5", features = ["serde"] }
 bytes = "1.9"
 parking_lot = "0.12"
 dashmap = "6.1"
+fs4 = { version = "0.13", features = ["sync"] }
 ahash = "0.8"
 semver = { version = "1.0", features = ["serde"] }
 regex = "1.11"
